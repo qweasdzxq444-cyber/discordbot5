@@ -34,6 +34,10 @@ const {
   getStateSecret
 } = require("../utils/state");
 const {
+  buildDirectDiscordAuthorizeUrl,
+  VERIFY_SCOPE
+} = require("../utils/directAuthorizeUrl");
+const {
   normalizeGuildPermissions,
   canAccessGuildDashboard
 } = require("../utils/guildPermissions");
@@ -714,8 +718,26 @@ function buildOAuthStartUrl(req, { guildId, roleId, panelRevision = null }) {
   return `${dashboardUrl}/auth/start?state=${encodeURIComponent(panelState)}`;
 }
 
-function buildDiscordAuthorizeUrl(req, options) {
-  return buildOAuthStartUrl(req, options);
+function buildDiscordAuthorizeUrl(req, {
+  guildId,
+  roleId,
+  panelRevision = null,
+  expectedUserId = null,
+  clientId = null,
+  scope = VERIFY_SCOPE
+} = {}) {
+  const dashboardUrl = getPublicBaseUrl();
+  const resolvedClientId = clientId || process.env.DISCORD_CLIENT_ID;
+
+  return buildDirectDiscordAuthorizeUrl({
+    clientId: resolvedClientId,
+    baseUrl: dashboardUrl,
+    guildId,
+    roleId,
+    panelRevision,
+    expectedUserId,
+    scope
+  });
 }
 
 function makePanelPayload(req, { guildId, verification }) {
@@ -725,7 +747,7 @@ function makePanelPayload(req, { guildId, verification }) {
   let oauthUrl = "";
 
   if (mode === "oauth") {
-    oauthUrl = buildOAuthStartUrl(req, {
+    oauthUrl = buildDiscordAuthorizeUrl(req, {
       guildId,
       roleId: verification.roleId,
       panelRevision: verification.panelRevision
@@ -1970,6 +1992,8 @@ router.delete("/api/guild/:guildId/member/:userId", requireAdmin, requireGuildAd
 router.get("/api/guild/:guildId", requireAdmin, requireGuildAdmin, (req, res) => handleGetGuildConfig(req, res, "get-guild", "โหลดการตั้งค่าเซิร์ฟเวอร์ไม่สำเร็จ"));
 
 router._test = {
+  buildDiscordAuthorizeUrl,
+  buildOAuthStartUrl,
   maskWebhookUrl,
   mergeVerificationConfig,
   tokenRevealErrorStatus,
