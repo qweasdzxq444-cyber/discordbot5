@@ -1,0 +1,734 @@
+'use strict';
+
+const assert = require('node:assert/strict');
+const test = require('node:test');
+
+const { IDS, isDmPanelButton, isDmPanelModal } = require('../commands/customIds');
+const {
+    buildDmPanelEmbed,
+    buildDmPanelRow,
+    buildConfirmationRow,
+    handleDmPanelCommand,
+    handleDmPanelButton,
+    handleDmPanelModal,
+    extractDmModalInputs,
+    validateDmModalFields
+} = require('../commands/dmPanel');
+const {
+    isValidWebhookUrl,
+    isBroadcastRunning,
+    getActiveBroadcastJob,
+    stageBroadcast,
+    getStagedBroadcast,
+    clearStagedBroadcast,
+    validateSecondaryBot,
+    startBroadcastJob,
+    buildMemberLogEmbed,
+    buildFinalSummaryEmbed,
+    _test
+} = require('../features/dmBroadcast');
+const config = require('../config.json');
+
+test('customIds correctly recognizes DM panel buttons and modals', () => { // NOSONAR
+    assert.equal(isDmPanelButton(IDS.BTN_DM_PANEL_OPEN), true);
+    assert.equal(isDmPanelButton(IDS.BTN_DM_CONFIRM), true);
+    assert.equal(isDmPanelButton(IDS.BTN_DM_CANCEL), true);
+    assert.equal(isDmPanelButton('random_button_id'), false);
+
+    assert.equal(isDmPanelModal(IDS.MODAL_DM_PANEL), true);
+    assert.equal(isDmPanelModal('random_modal_id'), false);
+});
+
+test('buildDmPanelEmbed and row produce valid Discord structures', () => { // NOSONAR
+    const embed = buildDmPanelEmbed();
+    assert.ok(embed);
+    assert.ok(embed.data.title.includes('ระบบกระจายข้อความ DM'));
+    assert.ok(embed.data.description.includes('ระบบส่ง DM ผ่านบอทตัวรอง'));
+    assert.ok(embed.data.description.includes('ดำเนินการทุกคนตามบอทที่อยู่ในเซิฟเวอร์นั้น'));
+    assert.ok(embed.data.description.includes('ตั้งค่าควบคุมผ่านปุ่มแผงควบคุมด้านล่าง'));
+    assert.equal(embed.data.description.includes('ระบบ One-shot'), false);
+
+    const embedWithAttachment = buildDmPanelEmbed({ hasAttachment: true });
+    assert.equal(embedWithAttachment.data.image.url, 'attachment://dm-panel-banner.gif');
+
+    const row = buildDmPanelRow();
+    assert.equal(row.components.length, 1);
+    assert.equal(row.components[0].data.custom_id, IDS.BTN_DM_PANEL_OPEN);
+
+    const confirmRow = buildConfirmationRow();
+    assert.equal(confirmRow.components.length, 2);
+    assert.equal(confirmRow.components[0].data.custom_id, IDS.BTN_DM_CONFIRM);
+    assert.equal(confirmRow.components[1].data.custom_id, IDS.BTN_DM_CANCEL);
+});
+
+test('isValidWebhookUrl accurately validates Discord webhook URLs', () => { // NOSONAR
+    assert.equal(isValidWebhookUrl('https://discord.com/api/webhooks/123456789012345678/abcdefg-ABC_123'), true);
+    assert.equal(isValidWebhookUrl('https://canary.discord.com/api/webhooks/123456789012345678/abcdefg-ABC_123'), true);
+    assert.equal(isValidWebhookUrl('https://ptb.discord.com/api/webhooks/123456789012345678/abcdefg-ABC_123'), true);
+    assert.equal(isValidWebhookUrl('https://discordapp.com/api/webhooks/123456789012345678/abcdefg-ABC_123'), true);
+
+    // Invalid URLs
+    assert.equal(isValidWebhookUrl('http://discord.com/api/webhooks/123456789012345678/token'), false);
+    assert.equal(isValidWebhookUrl('https://evil.com/api/webhooks/123456789012345678/token'), false);
+    assert.equal(isValidWebhookUrl('https://discord.com/api/notwebhooks/123/token'), false);
+    assert.equal(isValidWebhookUrl(''), false);
+    assert.equal(isValidWebhookUrl(null), false);
+    assert.equal(isValidWebhookUrl('https://discord.com/api/webhooks/short/token'), false);
+});
+
+test('stageBroadcast and getStagedBroadcast manage staging TTL properly', () => { // NOSONAR
+    const userId = '123456789012345678';
+    clearStagedBroadcast(userId);
+    assert.equal(getStagedBroadcast(userId), null);
+
+    stageBroadcast(userId, { token: 'mock-token', guildId: '123456789012345678' });
+    const staged = getStagedBroadcast(userId);
+    assert.ok(staged);
+    assert.equal(staged.token, 'mock-token');
+
+    clearStagedBroadcast(userId);
+    assert.equal(getStagedBroadcast(userId), null);
+});
+
+test('validateSecondaryBot handles input validation and error cases', async () => { // NOSONAR
+    // Empty token
+    const res1 = await validateSecondaryBot('', '123456789012345678');
+    assert.equal(res1.ok, false);
+    assert.ok(res1.error.includes('กรุณากรอก Bot Token'));
+
+    // Invalid Snowflake
+    const res2 = await validateSecondaryBot('test-token', 'invalid-id');
+    assert.equal(res2.ok, false);
+    assert.ok(res2.error.includes('Server ID'));
+
+    // Simulated login failure
+    class FailingLoginClient {
+        async login() {
+            throw new Error('An invalid token was provided.');
+        }
+        async destroy() {}
+    }
+    const res3 = await validateSecondaryBot('bad-token', '123456789012345678', {
+        ClientClass: FailingLoginClient
+    });
+    assert.equal(res3.ok, false);
+    assert.ok(res3.error.includes('Invalid Discord Token'));
+
+    // Simulated Guild not found
+    class GuildNotFoundClient {
+        async login() {}
+        get guilds() {
+            return {
+                fetch: async () => { throw new Error('Unknown Guild'); }
+            };
+        }
+        async destroy() {}
+    }
+    const res4 = await validateSecondaryBot('valid-token', '123456789012345678', {
+        ClientClass: GuildNotFoundClient
+    });
+    assert.equal(res4.ok, false);
+    assert.ok(res4.error.includes('บอทตัวรองไม่ได้อยู่ในเซิร์ฟเวอร์'));
+
+    // Simulated Missing GuildMembers Intent
+    class MissingIntentClient {
+        async login() {}
+        get guilds() {
+            return {
+                fetch: async () => ({
+                    id: '123456789012345678',
+                    name: 'Test Server',
+                    members: {
+                        fetch: async () => {
+                            const err = new Error('Disallowed intent(s)');
+                            err.code = 4014;
+                            throw err;
+                        }
+                    }
+                })
+            };
+        }
+        async destroy() {}
+    }
+    const res5 = await validateSecondaryBot('valid-token', '123456789012345678', {
+        ClientClass: MissingIntentClient
+    });
+    assert.equal(res5.ok, false);
+    assert.ok(res5.error.includes('Server Members Intent'));
+
+    // Successful validation
+    class SuccessClient {
+        constructor() {
+            this.user = {
+                id: '999999999999999999',
+                tag: 'HelperBot#0001',
+                displayAvatarURL: () => 'https://example.com/avatar.png'
+            };
+        }
+        async login() {}
+        get guilds() {
+            return {
+                fetch: async () => ({
+                    id: '123456789012345678',
+                    name: 'Test Guild',
+                    iconURL: () => 'https://example.com/icon.png',
+                    members: {
+                        fetch: async () => [
+                            { id: '1', user: { id: '1', bot: false } },
+                            { id: '2', user: { id: '2', bot: true } },
+                            { id: '3', user: { id: '3', bot: false } }
+                        ]
+                    }
+                })
+            };
+        }
+        async destroy() {}
+    }
+    const res6 = await validateSecondaryBot('valid-token', '123456789012345678', {
+        ClientClass: SuccessClient
+    });
+    assert.equal(res6.ok, true);
+    assert.equal(res6.targetCount, 2);
+    assert.equal(res6.botUser.tag, 'HelperBot#0001');
+    assert.equal(res6.guild.name, 'Test Guild');
+});
+
+test('buildMemberLogEmbed and buildFinalSummaryEmbed construct clean reports', () => { // NOSONAR
+    const memberEmbed = buildMemberLogEmbed({
+        member: { id: '111222333444555666', user: { tag: 'User#1234', id: '111222333444555666' } },
+        botUser: { tag: 'Helper#0001' },
+        index: 1,
+        total: 10,
+        success: true
+    });
+    assert.ok(memberEmbed);
+    assert.ok(memberEmbed.data.title.includes('[1/10]'));
+
+    const summaryEmbed = buildFinalSummaryEmbed({
+        guild: { name: 'Awesome Server', id: '123456789012345678' },
+        botUser: { tag: 'Helper#0001' },
+        total: 10,
+        sent: 8,
+        failed: 2,
+        durationMs: 25000
+    });
+    assert.ok(summaryEmbed);
+    assert.ok(summaryEmbed.data.title.includes('รายงานสรุป'));
+});
+
+test('startBroadcastJob enforces concurrency and executes worker workflow', async () => { // NOSONAR
+    _test.resetActiveJob();
+    assert.equal(isBroadcastRunning(), false);
+
+    // Invalid webhook
+    const badWebhookResult = await startBroadcastJob({
+        token: 'token',
+        guildId: '123456789012345678',
+        message: 'hello',
+        webhookUrl: 'https://invalid.com'
+    });
+    assert.equal(badWebhookResult.ok, false);
+    assert.ok(badWebhookResult.error.includes('Webhook URL'));
+
+    // Simulated client and webhook
+    const sentDMs = [];
+    const webhookPayloads = [];
+
+    class MockWorkerClient {
+        constructor() {
+            this.user = { id: 'bot-1', tag: 'Helper#0001' };
+        }
+        async login() {}
+        get guilds() {
+            return {
+                fetch: async () => ({
+                    id: '123456789012345678',
+                    name: 'Target Guild',
+                    iconURL: () => null,
+                    members: {
+                        fetch: async () => new Map([
+                            ['user-1', {
+                                id: 'user-1',
+                                user: { id: 'user-1', bot: false, tag: 'UserOne#0001' },
+                                send: async (payload) => { sentDMs.push({ id: 'user-1', payload }); }
+                            }],
+                            ['bot-2', {
+                                id: 'bot-2',
+                                user: { id: 'bot-2', bot: true, tag: 'BotTwo#0002' },
+                                send: async () => { throw new Error('should not send to bot'); }
+                            }],
+                            ['user-3', {
+                                id: 'user-3',
+                                user: { id: 'user-3', bot: false, tag: 'UserThree#0003' },
+                                send: async () => {
+                                    const err = new Error('Cannot send messages to this user');
+                                    err.code = 50007;
+                                    throw err;
+                                }
+                            }]
+                        ])
+                    }
+                })
+            };
+        }
+        async destroy() {}
+    }
+
+    class MockWebhookClient {
+        async send(payload) {
+            webhookPayloads.push(payload);
+        }
+        destroy() {}
+    }
+
+    let completionData = null;
+    const jobResult = await startBroadcastJob({
+        token: 'valid-token',
+        guildId: '123456789012345678',
+        message: 'Hello Promotion!',
+        imageUrl: 'https://example.com/banner.png',
+        webhookUrl: 'https://discord.com/api/webhooks/123456789012345678/token123',
+        initiatedBy: 'owner-id',
+        ClientClass: MockWorkerClient,
+        WebhookClientClass: MockWebhookClient,
+        onComplete: (data) => {
+            completionData = data;
+        }
+    });
+
+    assert.equal(jobResult.ok, true);
+    assert.equal(isBroadcastRunning(), true);
+
+    // Second job attempt must be rejected while active
+    const secondJob = await startBroadcastJob({
+        token: 'token-2',
+        guildId: '123456789012345678',
+        message: 'test',
+        webhookUrl: 'https://discord.com/api/webhooks/123456789012345678/token123'
+    });
+    assert.equal(secondJob.ok, false);
+    assert.ok(secondJob.error.includes('มีงานกระจายข้อความ DM กำลังทำงาน'));
+
+    // Wait for async loop to finish
+    let waitCount = 0;
+    while (isBroadcastRunning() && waitCount < 100) {
+        await new Promise(r => setTimeout(r, 100));
+        waitCount++;
+    }
+
+    assert.equal(isBroadcastRunning(), false);
+    assert.ok(completionData);
+    assert.equal(completionData.ok, true);
+    assert.equal(completionData.total, 2);
+    assert.equal(completionData.sent, 1);
+    assert.equal(completionData.failed, 1);
+
+    // DM sent verification
+    assert.equal(sentDMs.length, 1);
+    assert.equal(sentDMs[0].id, 'user-1');
+    assert.equal(sentDMs[0].payload.content, 'Hello Promotion!');
+
+    // Webhook delivery verification: 2 individual logs + 1 final summary = 3 messages
+    assert.equal(webhookPayloads.length, 3);
+});
+
+test('command and button guards prevent non-owner execution', async () => { // NOSONAR
+    const nonOwnerId = '111111111111111111';
+    let replyPayload = null;
+
+    const fakeInteraction = {
+        user: { id: nonOwnerId },
+        customId: IDS.BTN_DM_PANEL_OPEN,
+        reply: async (p) => { replyPayload = p; }
+    };
+
+    // Command test
+    await handleDmPanelCommand(fakeInteraction);
+    assert.ok(replyPayload);
+    assert.ok(replyPayload.content.includes('สงวนสิทธิ์เฉพาะ'));
+
+    // Button test
+    replyPayload = null;
+    await handleDmPanelButton(fakeInteraction);
+    assert.ok(replyPayload);
+    assert.ok(replyPayload.content.includes('สงวนสิทธิ์เฉพาะ'));
+
+    // Modal test
+    replyPayload = null;
+    await handleDmPanelModal(fakeInteraction);
+    assert.ok(replyPayload);
+    assert.ok(replyPayload.content.includes('ไม่มีสิทธิ์ส่งแบบฟอร์มนี้'));
+
+    // Owner command test (checks banner attachment)
+    const ownerId = config.system?.ownerId || '661415152146710558';
+    let ownerReplyPayload = null;
+    const ownerInteraction = {
+        user: { id: ownerId },
+        reply: async (p) => { ownerReplyPayload = p; }
+    };
+    await handleDmPanelCommand(ownerInteraction);
+    assert.ok(ownerReplyPayload);
+    assert.ok(Array.isArray(ownerReplyPayload.embeds));
+    assert.ok(Array.isArray(ownerReplyPayload.components));
+    assert.ok(Array.isArray(ownerReplyPayload.files));
+    assert.equal(ownerReplyPayload.files.length, 1);
+});
+
+test('handleDmPanelCommand defers reply and transitions via editReply to prevent timeouts', async () => {
+    const ownerId = config.system?.ownerId || '661415152146710558';
+    let deferred = false;
+    let editReplyPayload = null;
+
+    const ownerInteraction = {
+        user: { id: ownerId },
+        deferred: false,
+        replied: false,
+        deferReply: async () => {
+            deferred = true;
+            ownerInteraction.deferred = true;
+        },
+        editReply: async (p) => {
+            editReplyPayload = p;
+            return p;
+        }
+    };
+
+    await handleDmPanelCommand(ownerInteraction);
+    assert.equal(deferred, true);
+    assert.ok(editReplyPayload);
+    assert.ok(editReplyPayload.files && editReplyPayload.files.length > 0);
+});
+
+test('handleDmPanelModal validates empty message and invalid image URL for owner', async () => { // NOSONAR
+    const ownerId = config.system?.ownerId || '661415152146710558';
+    let editReplyPayload = null;
+
+    // Test empty message
+    const emptyMessageInteraction = {
+        user: { id: ownerId },
+        deferReply: async () => {},
+        editReply: async (p) => { editReplyPayload = p; },
+        fields: {
+            getTextInputValue: (field) => {
+                if (field === IDS.FIELD_DM_TOKEN) return 'valid-token';
+                if (field === IDS.FIELD_DM_GUILD_ID) return '123456789012345678';
+                if (field === IDS.FIELD_DM_MESSAGE) return '   ';
+                if (field === IDS.FIELD_DM_WEBHOOK) return 'https://discord.com/api/webhooks/123456789012345678/token123';
+                return '';
+            }
+        }
+    };
+
+    await handleDmPanelModal(emptyMessageInteraction);
+    assert.ok(editReplyPayload);
+    assert.ok(editReplyPayload.content.includes('ข้อความว่างเปล่า'));
+
+    // Test invalid image URL
+    editReplyPayload = null;
+    const badImageInteraction = {
+        user: { id: ownerId },
+        deferReply: async () => {},
+        editReply: async (p) => { editReplyPayload = p; },
+        fields: {
+            getTextInputValue: (field) => {
+                if (field === IDS.FIELD_DM_TOKEN) return 'valid-token';
+                if (field === IDS.FIELD_DM_GUILD_ID) return '123456789012345678';
+                if (field === IDS.FIELD_DM_MESSAGE) return 'Valid message';
+                if (field === IDS.FIELD_DM_IMAGE) return 'not-a-valid-url';
+                if (field === IDS.FIELD_DM_WEBHOOK) return 'https://discord.com/api/webhooks/123456789012345678/token123';
+                return '';
+            }
+        }
+    };
+
+    await handleDmPanelModal(badImageInteraction);
+    assert.ok(editReplyPayload);
+    assert.ok(editReplyPayload.content.includes('ลิงก์รูปภาพไม่ถูกต้อง'));
+});
+
+test('startBroadcastJob sends error embed to webhook on fatal error', async () => { // NOSONAR
+    _test.resetActiveJob();
+    const webhookPayloads = [];
+
+    class FatalFailClient {
+        async login() {
+            throw new Error('Connection refused or banned token');
+        }
+        async destroy() {}
+    }
+
+    class MockWebhookClient {
+        async send(payload) {
+            webhookPayloads.push(payload);
+        }
+        destroy() {}
+    }
+
+    let completion = null;
+    await startBroadcastJob({
+        token: 'fatal-token',
+        guildId: '123456789012345678',
+        message: 'hello',
+        webhookUrl: 'https://discord.com/api/webhooks/123456789012345678/token123',
+        ClientClass: FatalFailClient,
+        WebhookClientClass: MockWebhookClient,
+        onComplete: (data) => {
+            completion = data;
+        }
+    });
+
+    let wait = 0;
+    while (isBroadcastRunning() && wait < 50) {
+        await new Promise(r => setTimeout(r, 50));
+        wait++;
+    }
+
+    assert.equal(isBroadcastRunning(), false);
+    assert.ok(completion);
+    assert.equal(completion.ok, false);
+    assert.ok(completion.error.includes('banned token'));
+    assert.equal(webhookPayloads.length, 1);
+    assert.ok(webhookPayloads[0].embeds[0].data.title.includes('หยุดชะงัก'));
+});
+
+test('extractDmModalInputs and validateDmModalFields process modal fields correctly', () => { // NOSONAR
+    const mockFields = {
+        getTextInputValue: (id) => {
+            if (id === IDS.FIELD_DM_TOKEN) return '  mock_token_abc  ';
+            if (id === IDS.FIELD_DM_GUILD_ID) return ' 123456789012345678 ';
+            if (id === IDS.FIELD_DM_MESSAGE) return '  Promotion message  ';
+            if (id === IDS.FIELD_DM_IMAGE) return '  https://example.com/img.png ';
+            if (id === IDS.FIELD_DM_WEBHOOK) return '  https://discord.com/api/webhooks/123456789012345678/token123 ';
+            return '';
+        }
+    };
+
+    const extracted = extractDmModalInputs(mockFields);
+    assert.equal(extracted.token, 'mock_token_abc');
+    assert.equal(extracted.guildId, '123456789012345678');
+    assert.equal(extracted.message, 'Promotion message');
+    assert.equal(extracted.imageUrl, 'https://example.com/img.png');
+    assert.equal(extracted.webhookUrl, 'https://discord.com/api/webhooks/123456789012345678/token123');
+
+    assert.equal(validateDmModalFields(extracted), null);
+});
+
+test('dmBroadcast integrates with tokenCoordinator for quarantine and activity lifecycle', async () => { // NOSONAR
+    const tokenCoordinator = require('../tokens/tokenCoordinator');
+    const testBotToken = 'dm-broadcast-coord-test-token';
+
+    // 1. Pre-quarantine token
+    tokenCoordinator.quarantineToken(testBotToken, 'Manual quarantine test');
+    assert.equal(tokenCoordinator.isQuarantined(testBotToken), true);
+
+    // 2. startBroadcastJob rejects quarantined token
+    const blockedJob = await startBroadcastJob({
+        token: testBotToken,
+        guildId: '123456789012345678',
+        message: 'hello',
+        webhookUrl: 'https://discord.com/api/webhooks/123456789012345678/token123'
+    });
+    assert.equal(blockedJob.ok, false);
+    assert.match(blockedJob.error, /Quarantined|ระงับชั่วคราว/);
+
+    // 3. validateSecondaryBot succeeds and releases quarantine + sets tokenType to bot
+    class MockValidClient {
+        async login() {}
+        get user() { return { id: '999111', tag: 'DmBot#1234' }; }
+        get guilds() {
+            return {
+                fetch: async () => ({
+                    id: '123456789012345678',
+                    name: 'Test Guild',
+                    members: {
+                        fetch: async () => [{ id: '1', user: { bot: false } }]
+                    }
+                })
+            };
+        }
+        async destroy() {}
+    }
+
+    const valResult = await validateSecondaryBot(testBotToken, '123456789012345678', {
+        ClientClass: MockValidClient
+    });
+    assert.equal(valResult.ok, true);
+    assert.equal(tokenCoordinator.isQuarantined(testBotToken), false);
+    assert.equal(tokenCoordinator.getTokenType(testBotToken), 'bot');
+
+    tokenCoordinator.reset();
+});
+
+test('dmBroadcast subsystem aborts active broadcast job when token is quarantined', async () => { // NOSONAR
+    const tokenCoordinator = require('../tokens/tokenCoordinator');
+    const testBotToken = 'dm-broadcast-abort-test-token';
+
+    _test.setActiveJob({
+        token: testBotToken,
+        aborted: false,
+        sent: 1,
+        failed: 0,
+        status: 'running'
+    });
+
+    assert.equal(isBroadcastRunning(), true);
+
+    // Quarantining the token should trigger onTokenQuarantined in dmBroadcast
+    tokenCoordinator.quarantineToken(testBotToken, 'Token was banned mid-broadcast');
+
+    const job = getActiveBroadcastJob();
+    assert.ok(job);
+    assert.equal(job.aborted, true);
+    assert.match(job.abortReason, /Token was banned mid-broadcast/);
+
+    _test.resetActiveJob();
+    tokenCoordinator.reset();
+});
+
+test('calculateAdaptiveThrottleMs produces Turbo range (1,200-1,500ms) and fast-skip (400-600ms)', () => { // NOSONAR
+    const { calculateAdaptiveThrottleMs } = _test;
+
+    for (let i = 0; i < 20; i++) {
+        const normalMs = calculateAdaptiveThrottleMs(false);
+        assert.ok(normalMs >= 1200 && normalMs <= 1500, `Expected normalMs ${normalMs} to be between 1200 and 1500`);
+
+        const fastSkipMs = calculateAdaptiveThrottleMs(true);
+        assert.ok(fastSkipMs >= 400 && fastSkipMs <= 600, `Expected fastSkipMs ${fastSkipMs} to be between 400 and 600`);
+    }
+});
+
+test('sendDmWithRetry handles robust 429 retry loop and recognizes closed DMs', async () => { // NOSONAR
+    const { sendDmWithRetry } = _test;
+
+    // 1. Success on first try
+    const goodMember = {
+        send: async () => 'ok'
+    };
+    const res1 = await sendDmWithRetry(goodMember, { content: 'hi' });
+    assert.equal(res1.success, true);
+    assert.equal(res1.isClosedDm, false);
+
+    // 2. Closed DMs (Error 50007) detected immediately
+    const closedMember = {
+        send: async () => {
+            const err = new Error('Cannot send messages to this user');
+            err.code = 50007;
+            throw err;
+        }
+    };
+    const res2 = await sendDmWithRetry(closedMember, { content: 'hi' });
+    assert.equal(res2.success, false);
+    assert.equal(res2.isClosedDm, true);
+    assert.match(res2.errorReason, /ปิดรับข้อความ/);
+
+    // 3. Rate limit 429 retries up to 5 times and succeeds
+    let attempts = 0;
+    const rateLimitedMember = {
+        send: async () => {
+            attempts++;
+            if (attempts <= 2) {
+                const err = new Error('Too Many Requests');
+                err.status = 429;
+                err.retryAfter = 0.01; // 0.01 seconds = 10ms for fast unit test
+                throw err;
+            }
+            return 'ok';
+        }
+    };
+    const res3 = await sendDmWithRetry(rateLimitedMember, { content: 'hi' }, 5);
+    assert.equal(res3.success, true);
+    assert.equal(attempts, 3);
+});
+
+test('handleDmPanelButton and validateDmModalFields comprehensive branch coverage', async () => {
+    const ownerId = process.env.OWNER_ID || config.system?.ownerId || '661415152146710558';
+
+    // 1. validateDmModalFields invalid webhook
+    const errBadWebhook = validateDmModalFields({
+        message: 'Hello',
+        webhookUrl: 'https://evil.com/webhook',
+        imageUrl: null
+    });
+    assert.match(errBadWebhook, /ลิงก์ Webhook ไม่ถูกต้อง/);
+
+    // 2. validateDmModalFields invalid image url
+    const errBadImage = validateDmModalFields({
+        message: 'Hello',
+        webhookUrl: 'https://discord.com/api/webhooks/123456789012345678/abc',
+        imageUrl: 'ftp://bad-url'
+    });
+    assert.match(errBadImage, /ลิงก์รูปภาพไม่ถูกต้อง/);
+
+    // 3. validateDmModalFields valid inputs
+    const validResult = validateDmModalFields({
+        message: 'Hello',
+        webhookUrl: 'https://discord.com/api/webhooks/123456789012345678/abc',
+        imageUrl: 'https://images.com/pic.png'
+    });
+    assert.equal(validResult, null);
+
+    // 4. handleDmPanelButton with unknown customId returns warning
+    let replyData = null;
+    await handleDmPanelButton({
+        user: { id: ownerId },
+        customId: 'dm_panel:unknown_id',
+        reply: async (data) => { replyData = data; return data; },
+        isRepliable: () => true,
+        deferred: false,
+        replied: false
+    });
+    assert.ok(replyData);
+    assert.match(replyData.content, /ปุ่มควบคุมนี้ไม่รองรับหรือไม่ถูกต้อง/);
+
+    // 5. handleDmPanelButton with BTN_DM_CANCEL
+    stageBroadcast(ownerId, { token: 'tok', guildId: '123', message: 'test' });
+    assert.ok(getStagedBroadcast(ownerId));
+    let updateData = null;
+    await handleDmPanelButton({
+        user: { id: ownerId },
+        customId: IDS.BTN_DM_CANCEL,
+        update: async (data) => { updateData = data; return data; }
+    });
+    assert.equal(getStagedBroadcast(ownerId), null);
+    assert.ok(updateData);
+    assert.match(updateData.content, /ยกเลิกการกระจายข้อความเรียบร้อยแล้ว/);
+
+    // 6. handleDmPanelButton with BTN_DM_CONFIRM when no staged data exists
+    let expiredUpdate = null;
+    await handleDmPanelButton({
+        user: { id: ownerId },
+        customId: IDS.BTN_DM_CONFIRM,
+        update: async (data) => { expiredUpdate = data; return data; }
+    });
+    assert.ok(expiredUpdate);
+    assert.match(expiredUpdate.content, /ข้อมูลการยืนยันหมดอายุหรือถูกยกเลิกแล้ว/);
+
+    // 7. handleDmPanelButton with BTN_DM_CONFIRM when broadcast is already running
+    _test.setActiveJob({ guildId: '999', isRunning: true });
+    stageBroadcast(ownerId, { token: 'tok', guildId: '123', message: 'test' });
+    let busyUpdate = null;
+    await handleDmPanelButton({
+        user: { id: ownerId },
+        customId: IDS.BTN_DM_CONFIRM,
+        update: async (data) => { busyUpdate = data; return data; }
+    });
+    assert.ok(busyUpdate);
+    assert.match(busyUpdate.content, /มีงานกระจายข้อความอื่นเริ่มทำงานก่อนหน้านี้แล้ว/);
+
+    // 8. handleDmPanelButton with BTN_DM_PANEL_OPEN when broadcast is already running
+    let busyOpen = null;
+    await handleDmPanelButton({
+        user: { id: ownerId },
+        customId: IDS.BTN_DM_PANEL_OPEN,
+        reply: async (data) => { busyOpen = data; return data; },
+        isRepliable: () => true,
+        deferred: false,
+        replied: false
+    });
+    assert.ok(busyOpen);
+    assert.match(busyOpen.content, /มีงานกระจายข้อความ DM กำลังดำเนินการอยู่ในขณะนี้/);
+
+    // Clean up
+    _test.resetActiveJob();
+    clearStagedBroadcast(ownerId);
+});

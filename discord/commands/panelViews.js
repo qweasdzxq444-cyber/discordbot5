@@ -1,0 +1,182 @@
+const { MessageEmbed, MessageActionRow, MessageButton, Modal, TextInputComponent } = require("../core/discordCompat");
+const config = require("../config.json");
+const { getPrimaryOwnerId } = require("../core/env");
+const { IDS, PREFIXES } = require("./customIds");
+const {
+    getVoiceAccountLabel,
+    getVoiceChannelLabel,
+    getVoiceStatusLabel
+} = require("../sessions/voiceLabels");
+
+const CB = "```";
+
+const VOICE_PANEL_BANNER_ATTACHMENT_NAME = "voice-online-banner.gif";
+
+function getVoicePanelBannerPath() {
+    try {
+        return require.resolve("../assets/voice-online-banner.gif");
+    } catch {
+        return null;
+    }
+}
+
+function buildControlPanelEmbed(_total = null, { hasAttachment = Boolean(getVoicePanelBannerPath()) } = {}) {
+    const primaryOwnerId = getPrimaryOwnerId();
+    const embed = new MessageEmbed()
+        .setColor(config.system.themeColors.primary)
+        .setTitle(`${config.emojis.universe} : Phomueangtai ระบบออนช่องเสียง`)
+        .setDescription(
+            `ระบบออนช่องเสียงอัตโนมัติ ${config.emojis.dreamworld}\n\n` +
+            `ออนไลน์ฟรีครบ 24. ${config.emojis.dreamworld}\n\n` +
+            `ตั้งค่าควบคุมผ่านปุ่มแผงควบคุมด้านล่าง ${config.emojis.dreamworld}\n\n` +
+            `*Developed by <@${primaryOwnerId}>*`
+        );
+
+    if (hasAttachment) {
+        embed.setImage(`attachment://${VOICE_PANEL_BANNER_ATTACHMENT_NAME}`);
+    } else if (config.system?.voiceBannerUrl) {
+        embed.setImage(config.system.voiceBannerUrl);
+    } else if (config.system?.bannerUrl) {
+        embed.setImage(config.system.bannerUrl);
+    }
+
+    return embed;
+}
+
+function buildControlPanelRow() {
+    return new MessageActionRow().addComponents(
+        new MessageButton()
+            .setCustomId(IDS.BTN_START)
+            .setLabel("เริ่มการทำงาน")
+            .setEmoji(config.emojis.signal)
+            .setStyle("SUCCESS"),
+
+        new MessageButton()
+            .setCustomId(IDS.BTN_STATUS)
+            .setLabel("สถานะ & จัดการ")
+            .setEmoji(config.emojis.ping)
+            .setStyle("PRIMARY"),
+
+        new MessageButton()
+            .setCustomId(IDS.BTN_STOP_ALL)
+            .setLabel("หยุดทั้งหมด")
+            .setEmoji(config.emojis.stop)
+            .setStyle("DANGER")
+    );
+}
+
+function buildVoiceStatusEmbed(session, page, total) {
+    const accountLabel = getVoiceAccountLabel(session);
+    const avatar =
+        session.accountAvatar ||
+        session.ownerAvatar ||
+        "https://cdn.discordapp.com/embed/avatars/0.png";
+    const userIdLabel = session.accountId ? `${CB}${session.accountId}${CB}` : "-";
+
+    return new MessageEmbed()
+        .setColor(config.system.themeColors.primary)
+        .setAuthor({
+            name: accountLabel,
+            iconURL: avatar
+        })
+        .setThumbnail(avatar)
+        .setDescription(
+            `— **บัญชีที่ออน:** ${CB}${accountLabel}${CB}\n` +
+            `— **User ID:** ${userIdLabel}\n` +
+            `— **เซิร์ฟเวอร์:** ${CB}${session.serverName || session.serverId || "-"}${CB}\n` +
+            `— **ช่องเสียง:** ${getVoiceChannelLabel(session)}\n` +
+            `— **สถานะ:** ${getVoiceStatusLabel(session, config)}\n` +
+            `— **ออนเมื่อ:** <t:${Math.floor((session.startedAt || Date.now()) / 1000)}:R>\n` +
+            `— **Reconnect:** ${session.reconnectCount || 0} ครั้ง`
+        );
+}
+
+function buildVoiceStatusControls(current, page) {
+    const isReady = current?.connection?.state?.status === "ready" && !current?.reconnecting;
+
+    const row = new MessageActionRow().addComponents(
+        new MessageButton()
+            .setCustomId(`${PREFIXES.STATUS_PAGE}${page - 1}`)
+            .setEmoji(config.emojis.page_prev)
+            .setStyle("SECONDARY"),
+
+        new MessageButton()
+            .setCustomId(`${PREFIXES.STATUS_STOP}${current.sessionId}`)
+            .setLabel("หยุดออนตัวนี้")
+            .setEmoji(config.emojis.status_offline)
+            .setStyle("DANGER")
+    );
+
+    if (!isReady) {
+        row.addComponents(
+            new MessageButton()
+                .setCustomId(`${PREFIXES.STATUS_RECONNECT}${current.sessionId}`)
+                .setLabel("เชื่อมต่อใหม่")
+                .setEmoji(config.emojis?.loading_circle || config.emojis?.loading || "🔄")
+                .setStyle("SUCCESS")
+        );
+    }
+
+    row.addComponents(
+        new MessageButton()
+            .setCustomId(`${PREFIXES.STATUS_PAGE}${page + 1}`)
+            .setEmoji(config.emojis.page_next)
+            .setStyle("SECONDARY")
+    );
+
+    return row;
+}
+
+function formatModalInputLabel(emoji, labelText) {
+    if (!emoji) return labelText;
+    if (emoji.startsWith("<") && emoji.endsWith(">")) {
+        return labelText;
+    }
+    const combined = `${emoji} ${labelText}`;
+    return combined.length <= 45 ? combined : labelText;
+}
+
+function buildStartModal() {
+    const modal = new Modal()
+        .setCustomId(IDS.MODAL_START)
+        .setTitle("ออนช่องเสียง");
+
+    modal.addComponents(
+        new MessageActionRow().addComponents(
+            new TextInputComponent()
+                .setCustomId(IDS.FIELD_TOKEN)
+                .setLabel("🔑 Token บัญชี (1 บรรทัดต่อ 1 บัญชี)")
+                .setStyle("PARAGRAPH")
+                .setPlaceholder("วาง Discord Token ที่นี่ (รองรับ 1-10 บัญชี โดยขึ้นบรรทัดใหม่)")
+                .setRequired(true)
+        ),
+
+        new MessageActionRow().addComponents(
+            new TextInputComponent()
+                .setCustomId(IDS.FIELD_SERVER_ID)
+                .setLabel(formatModalInputLabel(config.emojis?.server_icon, "ไอดีเซิร์ฟเวอร์"))
+                .setStyle("SHORT")
+                .setRequired(true)
+        ),
+
+        new MessageActionRow().addComponents(
+            new TextInputComponent()
+                .setCustomId(IDS.FIELD_VOICE_ID)
+                .setLabel(formatModalInputLabel(config.emojis?.voice_ch, "ไอดีช่องเสียง"))
+                .setStyle("SHORT")
+                .setRequired(true)
+        )
+    );
+
+    return modal;
+}
+
+module.exports = {
+    VOICE_PANEL_BANNER_ATTACHMENT_NAME,
+    getVoicePanelBannerPath,
+    buildControlPanelEmbed,
+    buildControlPanelRow,
+    buildVoiceStatusEmbed,
+    buildVoiceStatusControls,
+    buildStartModal
+};

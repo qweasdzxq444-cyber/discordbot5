@@ -1,0 +1,1294 @@
+"use strict";
+
+const { Colors, WebhookClient } = require("discord.js");
+const crypto = require("node:crypto");
+const { resolvePublicBaseUrl } = require("./publicUrl");
+const { readFiniteInteger } = require("./numbers");
+
+const WEBHOOK_TARGETS = Object.freeze({
+    LOG: "WEBHOOK_LOG_URL",
+    ALERT: "ALERT_WEBHOOK_URL"
+});
+const WEBHOOK_SEVERITIES = Object.freeze({
+    INFO: "INFO",
+    SUCCESS: "SUCCESS",
+    WARNING: "WARNING",
+    ERROR: "ERROR",
+    CRITICAL: "CRITICAL"
+});
+const WEBHOOK_EVENT_STATES = Object.freeze({
+    OPEN: "OPEN",
+    UPDATE: "UPDATE",
+    RESOLVED: "RESOLVED"
+});
+const EVENT_PRESENTATION = Object.freeze({
+    INFO: { emoji: "🔵", color: Colors.Blurple, label: "ข้อมูล" },
+    SUCCESS: { emoji: "🟢", color: Colors.Green, label: "สำเร็จ" },
+    WARNING: { emoji: "🟠", color: Colors.Yellow, label: "คำเตือน" },
+    ERROR: { emoji: "🔴", color: Colors.Red, label: "ข้อผิดพลาด" },
+    CRITICAL: { emoji: "🚨", color: Colors.DarkRed, label: "วิกฤต" }
+});
+const EVENT_STATE_LABELS = Object.freeze({
+    OPEN: "เกิดปัญหา",
+    UPDATE: "กำลังติดตาม",
+    RESOLVED: "แก้ไขแล้ว"
+});
+const EVENT_CATEGORY_LABELS = Object.freeze({
+    SYSTEM: "SYSTEM",
+    RUNTIME: "RUNTIME",
+    GATEWAY: "GATEWAY",
+    DATABASE: "DATABASE",
+    COMMAND: "COMMAND",
+    GUILD: "GUILD",
+    OWNER: "OWNER",
+    MODERATION: "MODERATION",
+    VOICE: "VOICE",
+    VOICE_ADMIN: "VOICE ADMIN",
+    VERIFICATION: "VERIFICATION",
+    TOKEN: "TOKEN",
+    SECURITY: "SECURITY",
+    TRACE: "TRACE",
+    QUEST: "QUEST",
+    CHANNEL: "CHANNEL",
+    WEBHOOK: "WEBHOOK",
+    DATA: "DATA",
+    CAMPAIGN: "CAMPAIGN"
+});
+const LOG_CATEGORY_COLORS = Object.freeze({
+    GUILD: 0x00F5D4,          // Electric Mint / Turquoise
+    MODERATION: 0xFF5722,     // Vibrant Coral Orange
+    OWNER: 0xFFD700,          // Radiant Gold
+    ADMIN: 0xFFA000,          // Vibrant Amber
+    QUEST: 0x9D4EDD,          // Cyber Violet / Neon Purple
+    TOKEN: 0x00BBF9,          // Vivid Cyan / Electric Diamond
+    SECURITY: 0xF72585,       // Hot Neon Pink
+    PROTECTION: 0xF72585,     // Hot Neon Pink
+    TRACE: 0xE0AAFF,          // Lavender Neon
+    VOICE: 0x38B6FF,          // Sky Electric Blue
+    VOICE_ADMIN: 0x0077B6,    // Ocean Deep Blue
+    VERIFICATION: 0x48CAE4,   // Crystal Ice Blue
+    COMMAND: 0x7209B7,        // Electric Indigo
+    DATABASE: 0x06D6A0,       // Neon Emerald Mint
+    GATEWAY: 0x4361EE,        // Vivid Cobalt
+    RUNTIME: 0x3A86FF,        // Vivid Azure
+    CHANNEL: 0x2EC4B6,        // Teal Sea
+    CAMPAIGN: 0xFF006E,       // Electric Rose
+    DATA: 0x2A9D8F,           // Ocean Pine
+    WEBHOOK: 0x8338EC,        // Neon Grape
+    SYSTEM: 0x00D2FF          // Vibrant Aqua Blue
+});
+const LOG_CATEGORY_EMOJIS = Object.freeze({
+    GUILD: "🏰",
+    MODERATION: "⚖️",
+    OWNER: "👑",
+    ADMIN: "⚙️",
+    QUEST: "🚀",
+    TOKEN: "🔑",
+    SECURITY: "🛡️",
+    PROTECTION: "🛡️",
+    TRACE: "🔍",
+    VOICE: "🔊",
+    VOICE_ADMIN: "🎙️",
+    VERIFICATION: "📋",
+    COMMAND: "⚡",
+    DATABASE: "💾",
+    GATEWAY: "🌐",
+    RUNTIME: "⚡",
+    CHANNEL: "💬",
+    WEBHOOK: "📡",
+    DATA: "📊",
+    CAMPAIGN: "🎯",
+    SYSTEM: "✨"
+});
+const DISCORD_WEBHOOK_HOSTS = new Set([
+    "discord.com",
+    "discordapp.com",
+    "canary.discord.com",
+    "ptb.discord.com"
+]);
+const DISCORD_MEDIA_HOSTS = new Set([
+    "cdn.discordapp.com",
+    "media.discordapp.net"
+]);
+const CONTENT_MAX = 2000;
+const EMBED_TOTAL_MAX = 6000;
+const EMBED_COUNT_MAX = 10;
+const FIELD_COUNT_MAX = 25;
+const DEFAULT_QUEUE_MAX = readFiniteInteger(process.env.WEBHOOK_QUEUE_MAX, { fallback: 500, min: 10, max: 5000 });
+const DEFAULT_CONCURRENCY = readFiniteInteger(process.env.WEBHOOK_CONCURRENCY, { fallback: 1, min: 1, max: 5 });
+const DEFAULT_ATTEMPTS = readFiniteInteger(process.env.WEBHOOK_MAX_ATTEMPTS, { fallback: 3, min: 1, max: 5 });
+const DEFAULT_TIMEOUT_MS = readFiniteInteger(process.env.WEBHOOK_SEND_TIMEOUT_MS, { fallback: 15000, min: 1000, max: 120000 });
+const ROUTINE_DEDUPE_MAX = readFiniteInteger(process.env.WEBHOOK_ROUTINE_DEDUPE_MAX, { fallback: 2000, min: 100, max: 20000 });
+const EVENT_TOKEN_INPUT_MAX = 500;
+const EVENT_TOKEN_OUTPUT_MAX = 100;
+
+function trimTrailingSlashes(value) {
+    let clean = String(value || "").trim();
+    while (clean.endsWith("/")) clean = clean.slice(0, -1);
+    return clean;
+}
+
+function getWebhookUrl(target, env = process.env) {
+    return trimTrailingSlashes(env[WEBHOOK_TARGETS[target] || target] || "") || null;
+}
+
+function validateWebhookUrl(value) {
+    const raw = String(value || "").trim();
+    if (!raw) return { configured: false, valid: false, code: "missing" };
+    try {
+        const parsed = new URL(raw);
+        const validPath = /^\/api(?:\/v\d+)?\/webhooks\/\d{5,25}\/[A-Za-z0-9._-]{20,}$/.test(parsed.pathname);
+        if (parsed.protocol !== "https:") return { configured: true, valid: false, code: "https_required" };
+        if (!DISCORD_WEBHOOK_HOSTS.has(parsed.hostname.toLowerCase())) {
+            return { configured: true, valid: false, code: "host_not_allowed" };
+        }
+        if (!validPath) return { configured: true, valid: false, code: "invalid_path" };
+        if (parsed.username || parsed.password) return { configured: true, valid: false, code: "credentials_not_allowed" };
+        return { configured: true, valid: true, code: "valid" };
+    } catch {
+        return { configured: true, valid: false, code: "invalid_url" };
+    }
+}
+
+function normalizeWebhookUrlForCompare(url) {
+    const validation = validateWebhookUrl(url);
+    if (!validation.valid) return trimTrailingSlashes(url);
+    const parsed = new URL(url);
+    parsed.hash = "";
+    parsed.search = "";
+    return trimTrailingSlashes(parsed.toString()).toLowerCase();
+}
+
+function getOwnerDashboardBaseUrl(env = process.env) {
+    const configured = resolvePublicBaseUrl(env, env.RENDER_EXTERNAL_URL || "");
+    if (!configured) return null;
+
+    try {
+        const parsed = new URL(configured);
+        if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password) return null;
+        parsed.hash = "";
+        parsed.search = "";
+        return parsed.origin;
+    } catch {
+        return null;
+    }
+}
+
+function getWebhookDiagnostics(env = process.env) {
+    const logUrl = getWebhookUrl("LOG", env);
+    const alertUrl = getWebhookUrl("ALERT", env);
+    const log = validateWebhookUrl(logUrl);
+    const alert = validateWebhookUrl(alertUrl);
+    const sameTarget = log.valid && alert.valid &&
+        normalizeWebhookUrlForCompare(logUrl) === normalizeWebhookUrlForCompare(alertUrl);
+    return {
+        hasLog: log.configured,
+        hasAlert: alert.configured,
+        logValid: log.valid,
+        alertValid: alert.valid,
+        logCode: log.code,
+        alertCode: alert.code,
+        sameTarget,
+        logTarget: log.configured ? "WEBHOOK_LOG_URL" : null,
+        alertTarget: alert.configured ? "ALERT_WEBHOOK_URL" : null
+    };
+}
+
+function truncate(value, max) {
+    const safeMax = Math.max(0, Number(max) || 0);
+    if (safeMax === 0) return "";
+    const clean = String(value ?? "").replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "");
+    if (clean.length <= safeMax) return clean;
+    const suffix = "… [TRUNCATED]";
+    if (safeMax <= suffix.length) return clean.slice(0, safeMax);
+    return `${clean.slice(0, safeMax - suffix.length)}${suffix}`;
+}
+
+function consumeText(value, limit, budget) {
+    const max = Math.max(0, Math.min(limit, budget.remaining));
+    const output = truncate(value, max);
+    budget.remaining = Math.max(0, budget.remaining - output.length);
+    return output;
+}
+
+function normalizeEmbed(embed, budget) {
+    if (!embed || typeof embed !== "object" || budget.remaining <= 0) return null;
+    const source = typeof embed.toJSON === "function" ? embed.toJSON() : { ...embed };
+    const safe = { ...source };
+    if (source.title != null) safe.title = consumeText(source.title, 256, budget);
+    if (source.description != null) safe.description = consumeText(source.description, 4096, budget);
+    if (source.author?.name != null) {
+        safe.author = { ...source.author, name: consumeText(source.author.name, 256, budget) };
+    }
+    if (source.footer?.text != null) {
+        safe.footer = { ...source.footer, text: consumeText(source.footer.text, 2048, budget) };
+    }
+    if (Array.isArray(source.fields)) {
+        safe.fields = source.fields.slice(0, FIELD_COUNT_MAX).map(field => ({
+            ...field,
+            name: consumeText(field?.name || "-", 256, budget),
+            value: consumeText(field?.value || "-", 1024, budget)
+        })).filter(field => field.name && field.value);
+    }
+    return safe;
+}
+
+function normalizeWebhookPayload(payload) {
+    let source;
+    if (typeof payload === "string") {
+        source = { content: payload };
+    } else if (payload && typeof payload === "object") {
+        source = { ...payload };
+    } else {
+        source = { content: String(payload || "") };
+    }
+    const normalized = { ...source };
+    if (source.content !== undefined) normalized.content = truncate(source.content, CONTENT_MAX);
+    const budget = { remaining: EMBED_TOTAL_MAX };
+    if (Array.isArray(source.embeds)) {
+        normalized.embeds = source.embeds
+            .slice(0, EMBED_COUNT_MAX)
+            .map(embed => normalizeEmbed(embed, budget))
+            .filter(Boolean);
+    }
+    return normalized;
+}
+
+function trimEdgeCharacter(value, character) {
+    let start = 0;
+    let end = value.length;
+    while (start < end && value[start] === character) start++;
+    while (end > start && value[end - 1] === character) end--;
+    return value.slice(start, end);
+}
+
+function normalizeEventToken(value, fallback) {
+    const replaced = String(value || fallback || "")
+        .slice(0, EVENT_TOKEN_INPUT_MAX)
+        .trim()
+        .toUpperCase()
+        .replace(/[^A-Z0-9_]+/g, "_");
+    const normalized = trimEdgeCharacter(replaced, "_").slice(0, EVENT_TOKEN_OUTPUT_MAX);
+    return normalized || fallback;
+}
+
+const DISCORD_MARKDOWN_CHARACTERS = new Set(["\\", "*", "_", "~", "|", ">", "[", "]", "(", ")"]);
+
+function escapeDiscordMarkdown(value) {
+    let output = "";
+    for (const character of String(value)) {
+        if (DISCORD_MARKDOWN_CHARACTERS.has(character)) output += "\\";
+        output += character;
+    }
+    return output;
+}
+
+function normalizeEventContextText(value, options = {}) {
+    const normalized = String(value)
+        .replace(/[\r\n\t]+/g, " ")
+        .replaceAll("`", "ˋ")
+        .trim();
+    return options.escapeMarkdown === false ? normalized : escapeDiscordMarkdown(normalized);
+}
+
+function isSafeDisplayUrl(value) {
+    if (typeof value !== "string") return false;
+    try {
+        const parsed = new URL(value);
+        return ["http:", "https:"].includes(parsed.protocol) && !parsed.username && !parsed.password;
+    } catch {
+        return false;
+    }
+}
+
+function formatEventContextValue(value) {
+    if (value === undefined || value === null || value === "") return "-";
+    if (typeof value === "boolean") return value ? "ใช่" : "ไม่";
+    if (Array.isArray(value)) return value.map(item => normalizeEventContextText(item)).join(", ");
+    if (typeof value === "object") {
+        try {
+            return normalizeEventContextText(JSON.stringify(value));
+        } catch {
+            return "[อ่านค่าไม่ได้]";
+        }
+    }
+    return normalizeEventContextText(value, { escapeMarkdown: !isSafeDisplayUrl(value) });
+}
+
+/**
+ * Resolves the webhook delivery destination ("LOG" or "ALERT").
+ *
+ * Routing Authority Hierarchy:
+ * 1. Explicit `target`: Caller-specified "LOG" or "ALERT" takes absolute precedence.
+ * 2. Action Required / Critical Severities: `actionRequired === true` or severity in {"ERROR", "CRITICAL"} routes to "ALERT".
+ * 3. Default: All other routine events route to "LOG".
+ */
+function resolveWebhookEventTarget(event = {}) {
+    const explicitTarget = normalizeEventToken(event.target, "");
+    if (explicitTarget === "LOG" || explicitTarget === "ALERT") return explicitTarget;
+    const severity = normalizeEventToken(event.severity, WEBHOOK_SEVERITIES.INFO);
+    if (event.actionRequired === true || severity === "ERROR" || severity === "CRITICAL") return "ALERT";
+    return "LOG";
+}
+
+function normalizeWebhookEventCode(value) {
+    const replaced = String(value || "system.event")
+        .slice(0, EVENT_TOKEN_INPUT_MAX)
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9._-]+/g, ".");
+    return trimEdgeCharacter(replaced, ".").slice(0, EVENT_TOKEN_OUTPUT_MAX) || "system.event";
+}
+
+function normalizeDiscordMediaUrl(value) {
+    const raw = String(value || "").trim();
+    if (!raw) return null;
+    try {
+        const parsed = new URL(raw);
+        if (parsed.protocol !== "https:" || parsed.username || parsed.password) return null;
+        if (!DISCORD_MEDIA_HOSTS.has(parsed.hostname.toLowerCase())) return null;
+        return parsed.toString();
+    } catch {
+        return null;
+    }
+}
+
+function getDiscordAvatarUrl(user) {
+    try {
+        return normalizeDiscordMediaUrl(
+            user?.displayAvatarURL?.({ forceStatic: false, size: 256 }) ||
+            user?.avatarURL?.({ forceStatic: false, size: 256 })
+        );
+    } catch {
+        return null;
+    }
+}
+
+function getDiscordGuildIconUrl(guild) {
+    try {
+        return normalizeDiscordMediaUrl(guild?.iconURL?.({ forceStatic: false, size: 256 }));
+    } catch {
+        return null;
+    }
+}
+
+function appendEventField(fields, name, value, inline) {
+    if (value === undefined || value === null || value === "") return;
+    fields.push({
+        name: normalizeEventContextText(name),
+        value: formatEventContextValue(value),
+        inline
+    });
+}
+
+function buildWebhookEventTitle(event, presentation, category, target = "LOG") {
+    const severity = normalizeEventToken(event?.severity, WEBHOOK_SEVERITIES.INFO);
+    let emoji = presentation?.emoji || "🔵";
+    if (target === "LOG" && severity === "INFO") {
+        const categoryToken = normalizeEventToken(event?.category, category);
+        emoji = LOG_CATEGORY_EMOJIS[categoryToken] || "✨";
+    }
+
+    let title = String(event?.title || "").trim();
+    if (!title) {
+        return `${emoji} ${category}`;
+    }
+    title = title.replace(/^(?:SHADOW REPORT:\s*|COMMAND LOG:\s*|ACTION:\s*|REPORT:\s*)/i, "");
+    title = title.replace(/^(?:[🔵🟢🟠🔴🚨]|[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}])+\s*/u, "");
+    const escapedCat = String(category).replace(/[.*+?^${}()|[\]\\]/g, String.raw`\$&`);
+    title = title.replace(new RegExp(String.raw`^${escapedCat}\s*[·•]\s*`, "i"), "");
+    title = title.replace(/^[A-Z_]{3,15}\s*[·•]\s*/, "");
+    title = title.trim();
+
+    // If title redundantly begins with the category name (e.g. "GATEWAY SHARD ERROR" in category "GATEWAY"),
+    // strip the redundant category prefix to yield e.g. "SHARD ERROR".
+    const redundantCategoryRegex = new RegExp(String.raw`^${escapedCat}\s+(?=\S)`, "i");
+    if (redundantCategoryRegex.test(title)) {
+        title = title.replace(redundantCategoryRegex, "").trim();
+    }
+
+    return `${emoji} ${category} · ${title}`;
+}
+
+function resolveWebhookEventColor(event, severity, categoryToken, target) {
+    if (Number.isFinite(Number(event?.color))) {
+        return Number(event.color);
+    }
+    // High-severity events retain standard priority colors across all targets
+    if (severity === "CRITICAL") return Colors.DarkRed;
+    if (severity === "ERROR") return Colors.Red;
+    if (severity === "WARNING") return Colors.Yellow;
+
+    // For ALERT targets, preserve standard presentation colors
+    if (target === "ALERT") {
+        return (EVENT_PRESENTATION[severity] || EVENT_PRESENTATION.INFO).color;
+    }
+
+    // For LOG targets:
+    if (severity === "SUCCESS") {
+        return 0x00E676; // Vivid Emerald Green (clean, punchy neon)
+    }
+
+    // Default INFO severity in LOG: vibrant category-specific neon color
+    return LOG_CATEGORY_COLORS[categoryToken] || 0x00D2FF;
+}
+
+
+function normalizeFieldName(name) {
+    return String(name ?? "").trim().toLowerCase();
+}
+
+function deleteMatchingFromContext(context, normalizedTarget) {
+    for (const key of Object.keys(context)) {
+        if (normalizeFieldName(key) === normalizedTarget) {
+            delete context[key];
+        }
+    }
+}
+
+function getAndDeleteFromContext(context, normalizedTarget) {
+    let foundValue;
+    for (const key of Object.keys(context)) {
+        if (normalizeFieldName(key) === normalizedTarget) {
+            if (foundValue === undefined && context[key] !== undefined && context[key] !== null && context[key] !== "") {
+                foundValue = context[key];
+            }
+            delete context[key];
+        }
+    }
+    return foundValue;
+}
+
+function deduplicateExplicitFields(rawExplicit) {
+    const deduplicatedExplicit = [];
+    const explicitMap = new Map();
+    for (const f of rawExplicit) {
+        const key = normalizeFieldName(f.name);
+        if (!key) continue;
+        if (!explicitMap.has(key)) {
+            const entry = { name: f.name, value: f.value, inline: f.inline };
+            explicitMap.set(key, entry);
+            deduplicatedExplicit.push(entry);
+        }
+    }
+    return { deduplicatedExplicit, explicitMap };
+}
+
+function createCanonicalFieldExtractor(deduplicatedExplicit, explicitMap, context, consumedNames) {
+    return function extractCanonicalField(name, fallbackVal, aliases = []) {
+        const namesToTry = [name, ...aliases];
+        const lowerNames = namesToTry.map(normalizeFieldName);
+
+        function consumeAllAliases() {
+            for (const lower of lowerNames) {
+                explicitMap.delete(lower);
+                deleteMatchingFromContext(context, lower);
+                consumedNames.add(lower);
+            }
+        }
+
+        // 1. Explicit event.fields takes highest precedence.
+        for (const f of deduplicatedExplicit) {
+            const lower = normalizeFieldName(f.name);
+            if (lowerNames.includes(lower) && explicitMap.has(lower)) {
+                const entry = explicitMap.get(lower);
+                consumeAllAliases();
+                return { value: entry.value, inline: entry.inline };
+            }
+        }
+
+        // 2. Top-level event value
+        if (fallbackVal !== undefined && fallbackVal !== null && fallbackVal !== "") {
+            consumeAllAliases();
+            return { value: fallbackVal, inline: undefined };
+        }
+
+        // 3. Context entry matching canonical field name or any alias
+        for (const lower of lowerNames) {
+            const contextVal = getAndDeleteFromContext(context, lower);
+            if (contextVal !== undefined) {
+                consumeAllAliases();
+                return { value: contextVal, inline: undefined };
+            }
+        }
+        return null;
+    };
+}
+
+function _appendCanonical(fields, extractCanonicalField, name, fallbackVal, defaultInline = true, aliases = []) {
+    const field = extractCanonicalField(name, fallbackVal, aliases);
+    if (field) {
+        appendEventField(fields, name, field.value, field.inline ?? defaultInline);
+    }
+}
+
+function appendAlertCanonicalFields(fields, event, state, extractCanonicalField) {
+    const serverVal = event.server || (event.guildName ? `${event.guildName} (${event.guildId})` : event.guildId);
+    const targetVal = event.targetUser || event.targetMember;
+
+    _appendCanonical(fields, extractCanonicalField, "สถานะ", state ? (EVENT_STATE_LABELS[state] || state) : null, true);
+    _appendCanonical(fields, extractCanonicalField, "ผลกระทบ", event.impact, false);
+    _appendCanonical(fields, extractCanonicalField, "สิ่งที่ควรทำ", event.action, false);
+    _appendCanonical(fields, extractCanonicalField, "เซิร์ฟเวอร์", serverVal, true);
+    _appendCanonical(fields, extractCanonicalField, "เป้าหมาย", targetVal, true, ["ผู้ใช้เป้าหมาย"]);
+    _appendCanonical(fields, extractCanonicalField, "รหัสข้อผิดพลาด", event.errorCode, true);
+    _appendCanonical(fields, extractCanonicalField, "รายละเอียด", event.details, false);
+}
+
+function appendLogCanonicalFields(fields, event, extractCanonicalField) {
+    const actorVal = event.actor || event.operator || event.user;
+    const serverVal = event.server || (event.guildName ? `${event.guildName} (${event.guildId})` : event.guildId);
+    const targetVal = event.targetUser || event.targetMember;
+    const actionVal = event.actionName || event.operation;
+    const resultVal = event.result || event.outcome;
+    const detailsVal = event.details || event.reason;
+
+    _appendCanonical(fields, extractCanonicalField, "ผู้ดำเนินการ", actorVal, true, ["ผู้สั่งการ", "ผู้กระทำ"]);
+    _appendCanonical(fields, extractCanonicalField, "เซิร์ฟเวอร์", serverVal, true);
+    _appendCanonical(fields, extractCanonicalField, "เป้าหมาย", targetVal, true);
+    _appendCanonical(fields, extractCanonicalField, "การกระทำ", actionVal, true);
+    _appendCanonical(fields, extractCanonicalField, "ผลลัพธ์", resultVal, true);
+    _appendCanonical(fields, extractCanonicalField, "รายละเอียด", detailsVal, false, ["เหตุผล", "reason"]);
+}
+
+function appendRemainingCustomFields(fields, deduplicatedExplicit, explicitMap, context, consumedNames) {
+    for (const f of deduplicatedExplicit) {
+        const lower = normalizeFieldName(f.name);
+        if (explicitMap.has(lower)) {
+            explicitMap.delete(lower);
+            deleteMatchingFromContext(context, lower);
+            consumedNames.add(lower);
+            appendEventField(fields, f.name, f.value, f.inline ?? true);
+        }
+    }
+
+    for (const [rawName, rawValue] of Object.entries(context)) {
+        const lower = normalizeFieldName(rawName);
+        if (!lower || consumedNames.has(lower) || rawValue === undefined || rawValue === null || rawValue === "") {
+            continue;
+        }
+        consumedNames.add(lower);
+        appendEventField(fields, String(rawName || "รายละเอียด").trim().slice(0, 100), rawValue, true);
+    }
+}
+
+function buildEventFields(event, state, target) {
+    const fields = [];
+    const context = { ...event.context };
+    const rawExplicit = Array.isArray(event.fields)
+        ? event.fields.filter(f => f?.name && f?.value != null && f?.value !== "")
+        : [];
+
+    const { deduplicatedExplicit, explicitMap } = deduplicateExplicitFields(rawExplicit);
+    const consumedNames = new Set();
+    const extractCanonicalField = createCanonicalFieldExtractor(deduplicatedExplicit, explicitMap, context, consumedNames);
+
+    if (target === "ALERT") {
+        appendAlertCanonicalFields(fields, event, state, extractCanonicalField);
+    } else {
+        appendLogCanonicalFields(fields, event, extractCanonicalField);
+    }
+
+    appendRemainingCustomFields(fields, deduplicatedExplicit, explicitMap, context, consumedNames);
+    return fields.slice(0, FIELD_COUNT_MAX);
+}
+
+function resolveEventTimestamp(value) {
+    const timestamp = new Date(Number(value || Date.now()));
+    return Number.isNaN(timestamp.getTime()) ? new Date() : timestamp;
+}
+
+function buildEventAuthor(target, sourceIconUrl) {
+    const targetLabel = target === "ALERT" ? "ACTION REQUIRED" : "ACTIVITY & AUDIT";
+    return {
+        name: `PHOMUEANGTAI • ${targetLabel}`,
+        ...(sourceIconUrl ? { icon_url: sourceIconUrl } : {})
+    };
+}
+
+function buildWebhookEventPayload(event = {}) {
+    const severity = normalizeEventToken(event.severity, WEBHOOK_SEVERITIES.INFO);
+    const presentation = EVENT_PRESENTATION[severity] || EVENT_PRESENTATION.INFO;
+    const categoryToken = normalizeEventToken(event.category, "SYSTEM");
+    const displayCategory = EVENT_CATEGORY_LABELS[categoryToken] || categoryToken.replaceAll("_", " ");
+    const target = resolveWebhookEventTarget({ ...event, severity });
+    const state = event.state ? normalizeEventToken(event.state, "UPDATE") : null;
+    const fields = buildEventFields(event, state, target);
+
+    const sourceIconUrl = normalizeDiscordMediaUrl(event.sourceIconUrl);
+    const thumbnailUrl = normalizeDiscordMediaUrl(event.thumbnailUrl);
+    const color = resolveWebhookEventColor(event, severity, categoryToken, target);
+    return {
+        embeds: [{
+            color,
+            author: buildEventAuthor(target, sourceIconUrl),
+            title: buildWebhookEventTitle(event, presentation, displayCategory, target),
+            description: event.description ? String(event.description) : undefined,
+            fields,
+            ...(thumbnailUrl ? { thumbnail: { url: thumbnailUrl } } : {}),
+            timestamp: resolveEventTimestamp(event.timestamp).toISOString()
+        }]
+    };
+}
+
+function chunkWebhookText(value, maxLength) {
+    const text = String(value ?? "");
+    const limit = Math.max(1, Number(maxLength) || 1);
+    const chunks = [];
+    for (let offset = 0; offset < text.length; offset += limit) chunks.push(text.slice(offset, offset + limit));
+    return chunks.length ? chunks : [""];
+}
+
+function serializePrivateEvent(event) {
+    const seen = new WeakSet();
+    return JSON.stringify(event, (_key, value) => {
+        if (typeof value === "bigint") return { $type: "bigint", value: value.toString() };
+        if (value && typeof value === "object") {
+            if (seen.has(value)) throw new TypeError("PRIVATE_WEBHOOK_CIRCULAR_EVENT");
+            seen.add(value);
+        }
+        return value;
+    });
+}
+
+function buildWebhookEventPayloads(event = {}, options = {}) {
+    const primary = buildWebhookEventPayload(event);
+    const allowContinuation = options.includeContinuation === true || event.includeContinuation === true;
+    if (!allowContinuation) {
+        return [primary];
+    }
+    let serialized;
+    try {
+        serialized = serializePrivateEvent(event);
+    } catch (error) {
+        serialized = JSON.stringify({ serializationError: String(error?.code || error?.name || "private_event_serialize_failed") });
+    }
+    const chunks = chunkWebhookText(serialized, 1000);
+    const payloads = [primary];
+    const chunkCount = chunks.length;
+    for (let index = 0; index < chunks.length; index += 5) {
+        const fields = chunks.slice(index, index + 5).map((value, offset) => ({
+            name: `Owner event continuation ${index + offset + 1}/${chunkCount}`,
+            value,
+            inline: false
+        }));
+        payloads.push({
+            embeds: [{
+                color: primary.embeds[0].color,
+                author: primary.embeds[0].author,
+                title: "Owner event continuation",
+                fields,
+                timestamp: primary.embeds[0].timestamp
+            }]
+        });
+    }
+    return payloads;
+}
+
+function normalizeLegacyWebhookPayload(target, payload) {
+    if (payload && typeof payload === "object" && Array.isArray(payload.embeds) && payload.embeds.length) {
+        return payload;
+    }
+    const content = typeof payload === "string" ? payload : payload?.content;
+    if (content === undefined || content === null) return payload;
+    return buildWebhookEventPayload({
+        target,
+        severity: target === "ALERT" ? "ERROR" : "INFO",
+        category: "SYSTEM",
+        code: target === "ALERT" ? "legacy.alert" : "legacy.log",
+        title: target === "ALERT" ? "การแจ้งเตือนจากระบบเดิม" : "บันทึกจากระบบเดิม",
+        description: String(content)
+    });
+}
+
+function failureCode(error) {
+    const status = Number(error?.status || error?.httpStatus || error?.response?.status || 0);
+    if (status) return `http_${status}`;
+    const code = String(error?.code || error?.name || "send_failed").toLowerCase();
+    return truncate(code.replace(/[^a-z0-9_-]/g, "_"), 80) || "send_failed";
+}
+
+function retryable(error) {
+    const status = Number(error?.status || error?.httpStatus || error?.response?.status || 0);
+    const code = String(error?.code || "").toLowerCase();
+    if (code === "send_timeout") return false;
+    if (status === 429 || status >= 500) return true;
+    return !status && !["invalid_webhook_url", "invalid_token"].includes(code);
+}
+
+function delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function withTimeout(promise, timeoutMs) {
+    let timer;
+    const timeout = new Promise((_, reject) => {
+        timer = setTimeout(() => {
+            const error = new Error("webhook send timeout");
+            error.code = "send_timeout";
+            reject(error);
+        }, timeoutMs);
+    });
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+function firstSendOutcome(sendPromise, timeoutMs) {
+    const outcome = Promise.resolve(sendPromise).then(
+        value => ({ state: "sent", value }),
+        error => ({ state: "failed", error })
+    );
+    let timer;
+    const timeout = new Promise(resolve => {
+        timer = setTimeout(() => resolve({ state: "timed_out" }), timeoutMs);
+    });
+    const first = Promise.race([outcome, timeout]).finally(() => clearTimeout(timer));
+    return { first, outcome };
+}
+
+function createTargetMetrics() {
+    return {
+        queued: 0,
+        sent: 0,
+        failed: 0,
+        dropped: 0,
+        retried: 0,
+        warningSuppressed: 0,
+        timedOut: 0,
+        pendingTimedOut: 0,
+        lateSucceeded: 0,
+        lateFailed: 0,
+        lastSuccessAt: null,
+        lastFailureAt: null,
+        lastFailureCode: null
+    };
+}
+
+class WebhookDispatcher {
+    constructor(options = {}) {
+        this.ClientClass = options.WebhookClientClass || WebhookClient;
+        this.env = options.env || process.env;
+        this.maxDepth = Math.max(1, Number(options.maxDepth || DEFAULT_QUEUE_MAX));
+        this.concurrency = Math.max(1, Number(options.concurrency || DEFAULT_CONCURRENCY));
+        this.maxAttempts = Math.max(1, Number(options.maxAttempts || DEFAULT_ATTEMPTS));
+        this.timeoutMs = Math.max(100, Number(options.timeoutMs || DEFAULT_TIMEOUT_MS));
+        this.delayFn = options.delayFn || delay;
+        this.queue = [];
+        this.active = 0;
+        this.accepting = true;
+        this.clients = new Map();
+        this.metrics = { LOG: createTargetMetrics(), ALERT: createTargetMetrics() };
+        this.lastFailureWarningAt = { LOG: 0, ALERT: 0 };
+        this.idleWaiters = [];
+        this.pendingReconciliations = new Set();
+        this.operationMax = readFiniteInteger(options.operationMax, {
+            fallback: Math.max(100, this.maxDepth * 2),
+            min: 10,
+            max: 10000
+        });
+        this.operations = new Map();
+    }
+
+    registerOperation(item, attempt) {
+        const id = crypto.randomUUID();
+        const operation = {
+            id,
+            target: item.target,
+            attempt,
+            state: "sending",
+            startedAt: Date.now(),
+            completedAt: null,
+            failureCode: null
+        };
+        this.operations.set(id, operation);
+        while (this.operations.size > this.operationMax) {
+            this.operations.delete(this.operations.keys().next().value);
+        }
+        return operation;
+    }
+
+    completeOperation(operation, state, error = null) {
+        operation.state = state;
+        operation.completedAt = Date.now();
+        operation.failureCode = error ? failureCode(error) : null;
+    }
+
+    trackTimedOutOperation(operation, outcome, metrics, url) {
+        metrics.timedOut++;
+        metrics.pendingTimedOut++;
+        metrics.lastFailureAt = Date.now();
+        metrics.lastFailureCode = "send_timeout_pending";
+        this.completeOperation(operation, "timed_out");
+        this.warnFailure(operation.target, metrics.lastFailureCode);
+
+        let reconciliation;
+        reconciliation = outcome.then(late => {
+            metrics.pendingTimedOut = Math.max(0, metrics.pendingTimedOut - 1);
+            if (late.state === "sent") {
+                metrics.lateSucceeded++;
+                metrics.sent++;
+                metrics.lastSuccessAt = Date.now();
+                this.completeOperation(operation, "late_succeeded");
+                return;
+            }
+            metrics.lateFailed++;
+            metrics.failed++;
+            metrics.lastFailureAt = Date.now();
+            metrics.lastFailureCode = failureCode(late.error);
+            this.completeOperation(operation, "late_failed", late.error);
+            this.discardClient(url);
+            this.warnFailure(operation.target, metrics.lastFailureCode);
+        }).finally(() => {
+            this.pendingReconciliations.delete(reconciliation);
+            this.resolveIdle();
+        });
+        this.pendingReconciliations.add(reconciliation);
+    }
+
+    warnFailure(target, code) {
+        const metrics = this.metrics[target] || this.metrics.LOG;
+        const now = Date.now();
+        if (now - Number(this.lastFailureWarningAt[target] || 0) < 60 * 1000) {
+            metrics.warningSuppressed++;
+            return;
+        }
+        this.lastFailureWarningAt[target] = now;
+        console.warn(`[WEBHOOK] ${target} delivery unavailable (${code}); inspect Owner diagnostics for counters.`);
+    }
+
+    insert(item) {
+        if (item.target !== "ALERT") {
+            this.queue.push(item);
+            return;
+        }
+        const firstLog = this.queue.findIndex(queued => queued.target !== "ALERT");
+        if (firstLog < 0) this.queue.push(item);
+        else this.queue.splice(firstLog, 0, item);
+    }
+
+    makeRoomForAlert(metrics) {
+        for (let index = this.queue.length - 1; index >= 0; index--) {
+            const queued = this.queue[index];
+            if (queued.target === "ALERT") continue;
+            this.queue.splice(index, 1);
+            const droppedMetrics = this.metrics[queued.target] || this.metrics.LOG;
+            droppedMetrics.dropped++;
+            droppedMetrics.lastFailureAt = Date.now();
+            droppedMetrics.lastFailureCode = "preempted_by_alert";
+            this.warnFailure(queued.target, droppedMetrics.lastFailureCode);
+            queued.resolve(false);
+            return true;
+        }
+        metrics.dropped++;
+        metrics.lastFailureAt = Date.now();
+        metrics.lastFailureCode = "queue_full";
+        this.warnFailure("ALERT", metrics.lastFailureCode);
+        return false;
+    }
+
+    enqueue(target, payload, options = {}) {
+        const metrics = this.metrics[target] || this.metrics.LOG;
+        const url = options.url || getWebhookUrl(target, options.env || this.env);
+        const validation = validateWebhookUrl(url);
+        if (!this.accepting || !validation.valid) {
+            metrics.failed++;
+            metrics.lastFailureAt = Date.now();
+            metrics.lastFailureCode = this.accepting ? validation.code : "dispatcher_stopping";
+            this.warnFailure(target, metrics.lastFailureCode);
+            return Promise.resolve(false);
+        }
+        if (this.queue.length + this.active >= this.maxDepth) {
+            if (target !== "ALERT" || !this.makeRoomForAlert(metrics)) return Promise.resolve(false);
+        }
+        metrics.queued++;
+        return new Promise(resolve => {
+            this.insert({ target, payload, options, url, resolve });
+            this.drain();
+        });
+    }
+
+    getClient(url) {
+        const current = this.clients.get(url);
+        if (current) return current;
+        const client = new this.ClientClass({ url });
+        this.clients.set(url, client);
+        return client;
+    }
+
+    discardClient(url) {
+        const client = this.clients.get(url);
+        try { client?.destroy?.(); } catch {}
+        this.clients.delete(url);
+    }
+
+    async deliver(item) {
+        const metrics = this.metrics[item.target] || this.metrics.LOG;
+        const normalized = normalizeWebhookPayload(item.payload);
+        let lastError = null;
+        for (let attempt = 1; attempt <= this.maxAttempts; attempt++) {
+            const operation = this.registerOperation(item, attempt);
+            try {
+                const client = this.getClient(item.url);
+                const { first, outcome } = firstSendOutcome(client.send(normalized), this.timeoutMs);
+                const delivery = await first;
+                if (delivery.state === "timed_out") {
+                    this.trackTimedOutOperation(operation, outcome, metrics, item.url);
+                    // Reliability Policy Note (P2):
+                    // An outbound HTTP request to Discord that exceeds timeoutMs cannot be cancelled
+                    // safely over TCP/TLS without risking duplicate execution if Discord accepted the
+                    // request despite network latency. We treat it as accepted-but-pending (returning true)
+                    // so callers and dedupe logic do not send an immediate duplicate. Late reconciliation
+                    // will update metrics (lateSucceeded / lateFailed) when the underlying socket resolves.
+                    return true;
+                }
+                if (delivery.state === "failed") throw delivery.error;
+                this.completeOperation(operation, "sent");
+                metrics.sent++;
+                metrics.lastSuccessAt = Date.now();
+                return true;
+            } catch (error) {
+                lastError = error;
+                this.completeOperation(operation, "failed", error);
+                if (attempt >= this.maxAttempts || !retryable(error)) break;
+                metrics.retried++;
+                await this.delayFn(Math.min(500 * 2 ** (attempt - 1), 5000));
+            }
+        }
+        metrics.failed++;
+        metrics.lastFailureAt = Date.now();
+        metrics.lastFailureCode = failureCode(lastError);
+        this.warnFailure(item.target, metrics.lastFailureCode);
+        return false;
+    }
+
+    drain() {
+        while (this.active < this.concurrency && this.queue.length) {
+            const item = this.queue.shift();
+            this.active++;
+            this.deliver(item)
+                .then(item.resolve, () => item.resolve(false))
+                .finally(() => {
+                    this.active--;
+                    this.resolveIdle();
+                    this.drain();
+                });
+        }
+    }
+
+    resolveIdle() {
+        if (this.active || this.queue.length || this.pendingReconciliations.size) return;
+        const waiters = this.idleWaiters;
+        this.idleWaiters = [];
+        for (const resolve of waiters) resolve(true);
+    }
+
+    async flush(timeoutMs = 5000) {
+        if (!this.active && !this.queue.length && !this.pendingReconciliations.size) return true;
+        return new Promise(resolve => {
+            let settled = false;
+            const finish = value => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                resolve(value);
+            };
+            const timer = setTimeout(() => finish(false), Math.max(100, Number(timeoutMs) || 5000));
+            this.idleWaiters.push(() => finish(true));
+        });
+    }
+
+    async shutdown(timeoutMs = 5000) {
+        this.accepting = false;
+        const flushed = await this.flush(timeoutMs);
+        for (const url of this.clients.keys()) this.discardClient(url);
+        return flushed;
+    }
+
+    stats() {
+        return {
+            accepting: this.accepting,
+            queueDepth: this.queue.length,
+            active: this.active,
+            pendingReconciliations: this.pendingReconciliations.size,
+            maxDepth: this.maxDepth,
+            concurrency: this.concurrency,
+            recentOperations: Array.from(this.operations.values()).map(operation => ({ ...operation })),
+            targets: structuredClone(this.metrics)
+        };
+    }
+}
+
+const defaultDispatcher = new WebhookDispatcher();
+const routineDedupe = new Map();
+const dispatcherIds = new WeakMap();
+let nextDispatcherId = 1;
+
+function dispatcherIdentity(dispatcher) {
+    if (!dispatcher || (typeof dispatcher !== "object" && typeof dispatcher !== "function")) return "default";
+    if (!dispatcherIds.has(dispatcher)) dispatcherIds.set(dispatcher, nextDispatcherId++);
+    return `dispatcher:${dispatcherIds.get(dispatcher)}`;
+}
+
+function dedupeDestinationKey(target, options = {}) {
+    const dispatcher = options.dispatcher || null;
+    const env = options.env || dispatcher?.env || process.env;
+    const url = normalizeWebhookUrlForCompare(options.url || getWebhookUrl(target, env) || "missing");
+    return crypto.createHash("sha256")
+        .update(`${target}\u0000${dispatcherIdentity(dispatcher)}\u0000${url}`)
+        .digest("hex")
+        .slice(0, 20);
+}
+
+function trimRoutineDedupe() {
+    while (routineDedupe.size > ROUTINE_DEDUPE_MAX) {
+        const key = routineDedupe.keys().next().value;
+        const entry = routineDedupe.get(key);
+        if (entry?.timer) clearTimeout(entry.timer);
+        routineDedupe.delete(key);
+    }
+}
+
+function buildDuplicateSummaryPayload(entry, ttlMs, stopping = false) {
+    return buildWebhookEventPayload({
+        target: entry.target,
+        severity: entry.target === "ALERT" ? "ERROR" : "WARNING",
+        category: entry.category || "SYSTEM",
+        code: `${entry.eventCode || "webhook.event"}.repeated`,
+        title: "สรุปเหตุการณ์ที่เกิดซ้ำ",
+        description: entry.label,
+        state: stopping ? "UPDATE" : undefined,
+        context: {
+            "เกิดซ้ำเพิ่ม": `${entry.duplicates} ครั้ง`,
+            "ช่วงเวลา": stopping ? "ก่อนระบบหยุด" : `${Math.round(ttlMs / 1000)} วินาที`
+        }
+    });
+}
+
+function _cleanDedupeEntry(key, entry) {
+    if (routineDedupe.get(key) === entry) {
+        if (entry.timer) clearTimeout(entry.timer);
+        routineDedupe.delete(key);
+    }
+}
+
+async function _handleExistingDedupe(key, existing) {
+    let firstDelivered = false;
+    try {
+        firstDelivered = await existing.pending;
+    } catch {
+        firstDelivered = false;
+    }
+    if (firstDelivered) {
+        existing.duplicates++;
+        return { handled: true, success: true };
+    }
+    // Delivery of the prior in-flight entry failed. Clean it up before retrying.
+    _cleanDedupeEntry(key, existing);
+    return { handled: false };
+}
+
+function _armDedupeTimer(key, entry, ttlMs) {
+    entry.timer = setTimeout(() => {
+        if (routineDedupe.get(key) === entry) {
+            routineDedupe.delete(key);
+        }
+        if (entry.duplicates > 0) {
+            sendWebhook(entry.target, buildDuplicateSummaryPayload(entry, ttlMs), entry.options).catch(() => {});
+        }
+    }, ttlMs);
+    entry.timer.unref?.();
+}
+
+async function _dispatchDedupeEntry(key, entry, target, payload, options, ttlMs) {
+    routineDedupe.set(key, entry);
+    trimRoutineDedupe();
+
+    let sent = false;
+    try {
+        const sendPromise = sendWebhook(target, payload, options);
+        entry.pending = sendPromise;
+        sent = await sendPromise;
+    } catch {
+        sent = false;
+    }
+
+    if (!sent) {
+        _cleanDedupeEntry(key, entry);
+        return false;
+    }
+
+    _armDedupeTimer(key, entry, ttlMs);
+    return true;
+}
+
+async function sendDedupedWebhook(target, payload, options) {
+    const baseKey = truncate(options.dedupeKey, 200) || "routine-event";
+    const key = `${dedupeDestinationKey(target, options)}:${baseKey}`;
+    const ttlMs = Math.max(1000, Number(options.dedupeMs || 5 * 60 * 1000));
+    let attempts = 0;
+
+    while (attempts++ < 3) {
+        const existing = routineDedupe.get(key);
+        if (existing) {
+            const result = await _handleExistingDedupe(key, existing);
+            if (result.handled) return result.success;
+            continue;
+        }
+
+        const entry = {
+            target,
+            duplicates: 0,
+            timer: null,
+            label: truncate(options.summaryLabel || "routine event", 120),
+            category: normalizeEventToken(options.summaryCategory, "SYSTEM"),
+            eventCode: normalizeWebhookEventCode(options.eventCode || "webhook.event"),
+            options,
+            pending: null
+        };
+
+        return _dispatchDedupeEntry(key, entry, target, payload, options, ttlMs);
+    }
+
+    return false;
+}
+
+function sendWebhook(target, payload, options = {}) {
+    if (Array.isArray(payload)) {
+        return Promise.all(payload.map(part => sendWebhook(target, part, options))).then(results => results.every(Boolean));
+    }
+    if (options.dispatcher) return options.dispatcher.enqueue(target, payload, options);
+    if (options.WebhookClientClass || options.env || options.url) {
+        const isolated = new WebhookDispatcher({
+            WebhookClientClass: options.WebhookClientClass,
+            env: options.env,
+            maxDepth: 1,
+            concurrency: 1,
+            maxAttempts: options.maxAttempts || 1,
+            timeoutMs: options.timeoutMs || DEFAULT_TIMEOUT_MS,
+            delayFn: options.delayFn
+        });
+        return isolated.enqueue(target, payload, options).finally(() => isolated.shutdown(100));
+    }
+    return defaultDispatcher.enqueue(target, payload, options);
+}
+
+function sendLogWebhook(payload, options = {}) {
+    const normalizedPayload = normalizeLegacyWebhookPayload("LOG", payload);
+    if (options.dedupeKey) return sendDedupedWebhook("LOG", normalizedPayload, options);
+    return sendWebhook("LOG", normalizedPayload, options);
+}
+
+function sendAlertWebhook(payload, options = {}) {
+    const normalizedPayload = normalizeLegacyWebhookPayload("ALERT", payload);
+    if (options.dedupeKey) return sendDedupedWebhook("ALERT", normalizedPayload, options);
+    return sendWebhook("ALERT", normalizedPayload, options);
+}
+
+function sendWebhookEvent(event, options = {}) {
+    const target = resolveWebhookEventTarget(event);
+    const eventOptions = {
+        ...options,
+        dedupeKey: options.dedupeKey || event.dedupeKey,
+        dedupeMs: options.dedupeMs || event.dedupeMs,
+        summaryLabel: options.summaryLabel || event.summaryLabel || event.title,
+        summaryCategory: options.summaryCategory || event.summaryCategory || event.category,
+        eventCode: options.eventCode || event.eventCode || event.code,
+        includeContinuation: options.includeContinuation ?? event.includeContinuation
+    };
+    const payload = buildWebhookEventPayloads({ ...event, target }, eventOptions);
+    return target === "ALERT"
+        ? sendAlertWebhook(payload, eventOptions)
+        : sendLogWebhook(payload, eventOptions);
+}
+
+async function flushWebhookQueue(timeoutMs = 5000) {
+    for (const [key, entry] of routineDedupe.entries()) {
+        if (entry.timer) clearTimeout(entry.timer);
+        if (entry.duplicates > 0) {
+            sendWebhook(entry.target, buildDuplicateSummaryPayload(entry, 0, true), entry.options).catch(() => {});
+        }
+        routineDedupe.delete(key);
+    }
+    return defaultDispatcher.flush(timeoutMs);
+}
+
+function shutdownWebhookDispatcher(timeoutMs = 5000) {
+    return defaultDispatcher.shutdown(timeoutMs);
+}
+
+function getWebhookDeliveryDiagnostics() {
+    return {
+        ...defaultDispatcher.stats(),
+        configuration: getWebhookDiagnostics(process.env),
+        dedupeKeys: routineDedupe.size,
+        routineDedupeKeys: routineDedupe.size
+    };
+}
+
+function buildStartupNotice({ clientTag, baseUrl, includeShadowPortal = true, timestamp = Date.now() }) {
+    const safeBase = getOwnerDashboardBaseUrl({ PUBLIC_BASE_URL: baseUrl });
+    const context = { "บัญชีบอท": clientTag || "unknown" };
+    if (safeBase) {
+        context.Dashboard = safeBase;
+        if (includeShadowPortal) context["Shadow Portal"] = `${safeBase}/shadow`;
+    } else {
+        context.Dashboard = "ยังไม่ได้ตั้งค่า public URL ที่ถูกต้อง";
+    }
+    return buildWebhookEventPayload({
+        target: "LOG",
+        severity: "SUCCESS",
+        category: "SYSTEM",
+        code: "system.ready",
+        title: "BOT READY",
+        description: "ระบบเริ่มต้นหลักเสร็จสมบูรณ์และบอทพร้อมให้บริการ",
+        context,
+        timestamp
+    });
+}
+
+module.exports = {
+    WEBHOOK_TARGETS,
+    WEBHOOK_SEVERITIES,
+    WEBHOOK_EVENT_STATES,
+    DISCORD_WEBHOOK_HOSTS,
+    DISCORD_MEDIA_HOSTS,
+    WebhookDispatcher,
+    getWebhookUrl,
+    validateWebhookUrl,
+    getOwnerDashboardBaseUrl,
+    getWebhookDiagnostics,
+    getWebhookDeliveryDiagnostics,
+    normalizeWebhookPayload,
+    normalizeLegacyWebhookPayload,
+    normalizeDiscordMediaUrl,
+    getDiscordAvatarUrl,
+    getDiscordGuildIconUrl,
+    resolveWebhookEventTarget,
+    buildWebhookEventPayload,
+    buildWebhookEventPayloads,
+    buildWebhookEventTitle,
+    sendWebhook,
+    sendLogWebhook,
+    sendAlertWebhook,
+    sendWebhookEvent,
+    flushWebhookQueue,
+    shutdownWebhookDispatcher,
+    buildStartupNotice,
+    _test: {
+        defaultDispatcher,
+        failureCode,
+        retryable,
+        withTimeout,
+        firstSendOutcome,
+        routineDedupe,
+        trimEdgeCharacter,
+        normalizeEventToken,
+        normalizeWebhookEventCode,
+        normalizeEventContextText,
+        escapeDiscordMarkdown,
+        buildEventFields,
+        buildWebhookEventTitle,
+        resolveWebhookEventColor,
+        LOG_CATEGORY_COLORS,
+        LOG_CATEGORY_EMOJIS
+    }
+};

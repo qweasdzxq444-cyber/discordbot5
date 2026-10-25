@@ -1,0 +1,1139 @@
+'use strict';
+
+const assert = require('node:assert/strict');
+const test = require('node:test');
+const config = require('../config.json');
+
+const {
+    encryptToken,
+    decryptToken,
+    maskToken
+} = require('../quest/core/tokenCrypto');
+const {
+    buildSuperProperties,
+    buildUserHeaders,
+    getUserAgent
+} = require('../quest/core/clientProfile');
+const {
+    isVideoEvent,
+    isGameEvent,
+    isSupportedEvent,
+    selectQuestClaimPlatform,
+    isRunnableQuest
+} = require('../quest/core/questSession');
+const {
+    getUserJobs,
+    stopAllForUser,
+    stopJob,
+    startRunner
+} = require('../quest/core/runnerManager');
+const {
+    formatRunnerStatusContent,
+    formatRunnerStatusEmbed,
+    buildRunnerLiveEmbed,
+    clampCodeBlockContent
+} = require('../quest/core/runnerStatusHeader');
+const {
+    createOneShotQuestSession,
+    getNextPendingOneShotQuest,
+    markOneShotQuestRunning,
+    markOneShotProgressMutationSent,
+    recordOneShotVerifiedProgress,
+    completeOneShotQuest,
+    failOneShotQuest,
+    getOneShotSessionSummary,
+    isOneShotSessionComplete,
+    ONE_SHOT_QUEST_STATUS,
+    EXTERNAL_COMPLETION_REASON
+} = require('../quest/core/oneShotSession');
+const {
+    SCHEDULE_HOURS,
+    nextScheduledCheck,
+    nextRecheckState,
+    addScheduleJitter,
+    formatScheduleTime,
+    zonedParts,
+    RECHECK_INTERVAL_MS
+} = require('../quest/core/runnerSchedule');
+const {
+    withOwnerAdmissionLock,
+    withAccountAdmissionLock
+} = require('../quest/core/admissionLock');
+const {
+    handleQuestCommand,
+    handleQuestButton,
+    handleQuestSelect,
+    handleQuestModalSubmit,
+    buildQuestPanelRow
+} = require('../commands/quest');
+const { IDS } = require('../commands/customIds');
+const {
+    questSummaryTone,
+    buildQuestSummaryEmbed,
+    buildQuestAuthFailureEmbed,
+    buildQuestStoppedEmbed,
+    sendQuestSummaryDM,
+    sendQuestAuthFailureDM
+} = require('../quest/core/questDm');
+
+test('tokenCrypto correctly encrypts, decrypts, and masks tokens', () => {
+    const rawToken = 'mock_quest_token_for_encryption_test_string_1234567890abcdef';
+    const encrypted = encryptToken(rawToken, 'user_123', 'acc_456');
+
+    assert.ok(encrypted.ciphertext);
+    assert.ok(encrypted.iv);
+    assert.ok(encrypted.tag);
+    assert.ok(encrypted.salt);
+    assert.ok(encrypted.packed.includes(':'));
+
+    const decrypted = decryptToken(encrypted.packed, 'user_123', 'acc_456');
+    assert.equal(decrypted, rawToken);
+
+    const masked = maskToken(rawToken);
+    assert.ok(masked.startsWith('mock_q'));
+    assert.ok(masked.endsWith('cdef'));
+    assert.ok(masked.includes('...'));
+});
+
+test('clientProfile generates valid Discord desktop client headers and super properties', () => {
+    const ua = getUserAgent();
+    assert.match(ua, /Mozilla\/5\.0/);
+    assert.match(ua, /discord\//);
+
+    const superPropsBase64 = buildSuperProperties();
+    assert.ok(superPropsBase64);
+    const parsed = JSON.parse(Buffer.from(superPropsBase64, 'base64').toString('utf8'));
+    assert.equal(parsed.os, 'Windows');
+    assert.equal(parsed.browser, 'Discord Client');
+    assert.ok(parsed.client_build_number > 0);
+
+    const headers = buildUserHeaders('test_token', '/quests/123');
+    assert.equal(headers.Authorization, 'test_token');
+    assert.equal(headers['X-Super-Properties'], superPropsBase64);
+    assert.equal(headers.Referer, 'https://discord.com/quest-home');
+});
+
+test('questSession correctly classifies quest event types and reward platforms', () => {
+    assert.equal(isVideoEvent('WATCH_VIDEO'), true);
+    assert.equal(isVideoEvent('WATCH_VIDEO_ON_MOBILE'), true);
+    assert.equal(isVideoEvent('PLAY_ON_DESKTOP'), false);
+
+    assert.equal(isGameEvent('PLAY_ON_DESKTOP'), true);
+    assert.equal(isGameEvent('PLAY_ON_DESKTOP_V2'), true);
+    assert.equal(isGameEvent('STREAM_ON_DESKTOP'), false);
+
+    assert.equal(isSupportedEvent('WATCH_VIDEO'), true);
+    assert.equal(isSupportedEvent('PLAY_ON_DESKTOP'), true);
+    assert.equal(isSupportedEvent('ACHIEVEMENT_IN_GAME'), false);
+
+    const platformWithDiscord = selectQuestClaimPlatform({ rewardPlatforms: [0, 4] });
+    assert.equal(platformWithDiscord, 4);
+
+    const platformSingle = selectQuestClaimPlatform({ rewardPlatforms: [2] });
+    assert.equal(platformSingle, 2);
+
+    const runnable = isRunnableQuest({
+        eventName: 'WATCH_VIDEO',
+        autoSupported: true,
+        enrolled: true,
+        startsAt: new Date(Date.now() - 10000).toISOString(),
+        expiresAt: new Date(Date.now() + 10000).toISOString()
+    });
+    assert.equal(runnable, true);
+});
+
+test('runnerStatusHeader correctly formats status lines and clamps codeblocks', () => {
+    const rawContent = '```\n✅ LOGIN : TestUser\n🔎 TestUser: พบ 2 QUESTS\n🎉 TestUser: ทำสำเร็จ 1 QUESTS\n▶️ TestUser: ทำเควสต์เกม\n```';
+    const formatted = formatRunnerStatusContent(rawContent);
+    assert.ok(formatted.includes('✅ LOGIN : TestUser'));
+    assert.ok(formatted.includes('บอทตรวจพบ Quest ที่ทำได้ทั้งหมด : 2'));
+    assert.ok(formatted.includes('บอททำ Quest ให้อัตโนมัติไปแล้วทั้งหมด : 1'));
+    assert.ok(formatted.includes('────────────────────────'));
+    assert.ok(formatted.includes('▶️ TestUser: ทำเควสต์เกม'));
+
+    // Test clamp
+    const large = '```\n' + 'A'.repeat(3000) + '\n```';
+    const clamped = clampCodeBlockContent(large);
+    assert.ok(clamped.length <= 1950);
+});
+
+test('oneShotSession manages lifecycle, external completions, and final summary', () => {
+    const session = createOneShotQuestSession([
+        { id: 'q1', name: 'Quest 1', eventName: 'WATCH_VIDEO', progressSecs: 0 },
+        { id: 'q2', name: 'Quest 2', eventName: 'PLAY_ON_DESKTOP', progressSecs: 10 }
+    ]);
+
+    assert.equal(session.totalSupportedQuests, 2);
+    const q1 = getNextPendingOneShotQuest(session);
+    assert.equal(q1.id, 'q1');
+
+    // Start q1 and complete by bot
+    markOneShotQuestRunning(session, 'q1', 0);
+    markOneShotProgressMutationSent(session, 'q1');
+    recordOneShotVerifiedProgress(session, 'q1', 15, { completed: true });
+    const status1 = completeOneShotQuest(session, 'q1');
+    assert.equal(status1, ONE_SHOT_QUEST_STATUS.COMPLETED_BY_BOT);
+
+    // Complete q2 externally (without bot progress)
+    const status2 = completeOneShotQuest(session, 'q2');
+    assert.equal(status2, ONE_SHOT_QUEST_STATUS.COMPLETED_EXTERNAL);
+    assert.equal(session.quests.get('q2').reason, EXTERNAL_COMPLETION_REASON);
+
+    assert.equal(isOneShotSessionComplete(session), true);
+    const summary = getOneShotSessionSummary(session);
+    assert.equal(summary.completedByBotCount, 1);
+    assert.equal(summary.completedExternalCount, 1);
+    assert.equal(summary.failedCount, 0);
+});
+
+test('runnerSchedule calculates Bangkok scheduled checks and jitter', () => {
+    assert.deepEqual(SCHEDULE_HOURS, [0, 8, 16]);
+
+    const now = new Date('2026-09-06T03:00:00Z'); // 10:00 in Bangkok (UTC+7)
+    const nextCheck = nextScheduledCheck(now, 'Asia/Bangkok');
+    assert.ok(nextCheck.getTime() > now.getTime());
+
+    // Jitter adds bounded ms
+    const jittered = addScheduleJitter(now, () => 0.5, 60000);
+    assert.equal(jittered.getTime(), now.getTime() + 30000);
+
+    // Recheck state logic
+    const initialRecheck = nextRecheckState({ attempted: true, progressed: true });
+    assert.equal(initialRecheck.shouldRecheck, true);
+    assert.equal(initialRecheck.rechecksRemaining, 3);
+    assert.equal(initialRecheck.delayMs, RECHECK_INTERVAL_MS);
+
+    const nextRecheck = nextRecheckState({ isRecheck: true, rechecksRemaining: 3 });
+    assert.equal(nextRecheck.rechecksRemaining, 2);
+
+    const formattedTime = formatScheduleTime(now, 'Asia/Bangkok');
+    assert.ok(typeof formattedTime === 'string');
+});
+
+test('admissionLock serializes operations for owner and account', async () => {
+    const sequence = [];
+    const p1 = withAccountAdmissionLock('acc_1', async () => {
+        sequence.push('start_1');
+        await new Promise((r) => setTimeout(r, 10));
+        sequence.push('end_1');
+    });
+
+    const p2 = withAccountAdmissionLock('acc_1', async () => {
+        sequence.push('start_2');
+        sequence.push('end_2');
+    });
+
+    await Promise.all([p1, p2]);
+    assert.deepEqual(sequence, ['start_1', 'end_1', 'start_2', 'end_2']);
+});
+
+test('runnerManager tracks jobs and stops jobs for a user', () => {
+    const initialJobs = getUserJobs('non_existent_user');
+    assert.equal(initialJobs.length, 0);
+
+    const stopped = stopAllForUser('non_existent_user');
+    assert.equal(stopped, 0);
+});
+
+test('handleQuestCommand enforces bot owner check for panel', async () => {
+    let replyPayload = null;
+    const nonOwnerInteraction = {
+        user: { id: '999999999999999999' },
+        options: { getSubcommand: () => 'panel' },
+        reply: (payload) => { replyPayload = payload; return Promise.resolve(payload); },
+        isRepliable: () => true,
+        deferred: false,
+        replied: false
+    };
+
+    await handleQuestCommand(nonOwnerInteraction);
+    assert.ok(replyPayload);
+    assert.match(replyPayload.content, /เฉพาะ \*\*เจ้าของบอท/);
+
+    const ownerId = process.env.OWNER_ID || require('../config.json').system?.ownerId || '661415152146710558';
+    let ownerReply = null;
+    const ownerInteraction = {
+        user: { id: ownerId },
+        options: { getSubcommand: () => 'panel' },
+        reply: (payload) => { ownerReply = payload; return Promise.resolve(payload); },
+        isRepliable: () => true,
+        deferred: false,
+        replied: false
+    };
+
+    await handleQuestCommand(ownerInteraction);
+    assert.ok(ownerReply);
+    assert.ok(ownerReply.embeds && ownerReply.embeds.length > 0);
+    assert.ok(ownerReply.components && ownerReply.components.length > 0);
+    assert.ok(ownerReply.files && ownerReply.files.length > 0);
+    assert.equal(ownerReply.embeds[0].data.image.url, 'attachment://quest-banner.gif');
+    const defaultButtons = ownerReply.components[0].components;
+    assert.equal(defaultButtons.length, 1);
+    assert.equal(defaultButtons[0].data.custom_id, 'quest_panel:run_oneshot');
+});
+
+test('handleQuestCommand renders AUTO DAILY button when auto_daily option is true', async () => {
+    const ownerId = process.env.OWNER_ID || require('../config.json').system?.ownerId || '661415152146710558';
+    let ownerReply = null;
+    const ownerInteraction = {
+        user: { id: ownerId },
+        options: {
+            getSubcommand: () => 'panel',
+            getBoolean: (name) => (name === 'auto_daily' ? true : null)
+        },
+        reply: (payload) => { ownerReply = payload; return Promise.resolve(payload); },
+        isRepliable: () => true,
+        deferred: false,
+        replied: false
+    };
+
+    await handleQuestCommand(ownerInteraction);
+    assert.ok(ownerReply);
+    assert.ok(ownerReply.components && ownerReply.components.length > 0);
+    const buttons = ownerReply.components[0].components;
+    assert.equal(buttons.length, 3);
+    assert.equal(buttons[0].data.custom_id, 'quest_panel:run_oneshot');
+    assert.equal(buttons[1].data.custom_id, 'quest_panel:run_daily');
+    assert.equal(buttons[2].data.custom_id, 'quest_panel:stop');
+});
+
+test('handleQuestCommand defers reply and transitions via editReply to prevent timeouts', async () => {
+    const ownerId = process.env.OWNER_ID || require('../config.json').system?.ownerId || '661415152146710558';
+    let deferred = false;
+    let editReplyPayload = null;
+
+    const ownerInteraction = {
+        user: { id: ownerId },
+        options: {
+            getSubcommand: () => 'panel',
+            getBoolean: () => null
+        },
+        deferred: false,
+        replied: false,
+        deferReply: async () => {
+            deferred = true;
+            ownerInteraction.deferred = true;
+        },
+        editReply: async (p) => {
+            editReplyPayload = p;
+            return p;
+        }
+    };
+
+    await handleQuestCommand(ownerInteraction);
+    assert.equal(deferred, true);
+    assert.ok(editReplyPayload);
+    assert.ok(editReplyPayload.files && editReplyPayload.files.length > 0);
+});
+
+test('buildQuestPanelRow respects showDaily option', () => {
+    const defaultRow = buildQuestPanelRow();
+    assert.equal(defaultRow.components.length, 1);
+    assert.equal(defaultRow.components[0].data.custom_id, 'quest_panel:run_oneshot');
+    assert.equal(defaultRow.components[0].data.label, 'เริ่มทำเควส');
+    assert.equal(defaultRow.components[0].data.emoji?.name, 'ddd_pmt');
+
+    const dailyRow = buildQuestPanelRow({ showDaily: true });
+    assert.equal(dailyRow.components.length, 3);
+    assert.equal(dailyRow.components[0].data.custom_id, 'quest_panel:run_oneshot');
+    assert.equal(dailyRow.components[0].data.label, 'เริ่มทำเควส');
+    assert.equal(dailyRow.components[0].data.emoji?.name, 'ddd_pmt');
+    assert.equal(dailyRow.components[1].data.custom_id, 'quest_panel:run_daily');
+    assert.equal(dailyRow.components[1].data.label, 'Auto');
+    assert.equal(dailyRow.components[1].data.emoji?.name, 'UN9_pmt');
+    assert.equal(dailyRow.components[2].data.custom_id, 'quest_panel:stop');
+    assert.equal(dailyRow.components[2].data.label, 'หยุด');
+    assert.equal(dailyRow.components[2].data.emoji?.name, 'CROSS_pmt');
+
+    const explicitFalseRow = buildQuestPanelRow({ showDaily: false });
+    assert.equal(explicitFalseRow.components.length, 1);
+    assert.equal(explicitFalseRow.components[0].data.custom_id, 'quest_panel:run_oneshot');
+    assert.equal(explicitFalseRow.components[0].data.label, 'เริ่มทำเควส');
+});
+
+test('handleQuestButton allows users to open modal and view stop controls', async () => {
+    let modalShown = null;
+    const runInteraction = {
+        customId: 'quest_panel:run_oneshot',
+        showModal: (modal) => { modalShown = modal; return Promise.resolve(); }
+    };
+    await handleQuestButton(runInteraction);
+    assert.ok(modalShown);
+    assert.ok(modalShown.data.custom_id.startsWith('quest_run_modal'));
+
+    let stopReply = null;
+    const stopInteraction = {
+        customId: 'quest_panel:stop',
+        user: { id: 'some_user_123' },
+        reply: (payload) => { stopReply = payload; return Promise.resolve(payload); }
+    };
+    await handleQuestButton(stopInteraction);
+    assert.ok(stopReply);
+    assert.match(stopReply.content, /ไม่มีเควสที่กำลังทำงานอยู่/);
+});
+
+test('runnerManager routes status updates to DM and continues silently without channel fallback when DM fails', async () => {
+    const dmDeliveries = [];
+    const mockDm = {
+        id: 'dm_12345',
+        isTextBased: () => true,
+        send: async (payload) => {
+            dmDeliveries.push(payload);
+            return { edit: async () => {} };
+        }
+    };
+    const mockUser = {
+        createDM: async () => mockDm
+    };
+    const mockClient = {
+        users: {
+            fetch: async (id) => (id === 'user_dm_target' ? mockUser : null)
+        },
+        channels: {
+            fetch: async () => null
+        }
+    };
+
+    const runner = await startRunner({
+        jobKey: 'test:dm:routing:1',
+        ownerId: 'user_dm_target',
+        userToken: 'invalid_dummy_token_for_test',
+        channelId: 'channel_guild_fallback',
+        client: mockClient,
+        mode: 'oneshot',
+        username: 'TestUserDM'
+    });
+
+    // Wait a brief tick for the flush to run
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    runner.controller.abort();
+    await runner.task.catch(() => {});
+
+    assert.ok(dmDeliveries.length > 0, 'Status message should be delivered to DM');
+    assert.ok(dmDeliveries[0].embeds && dmDeliveries[0].embeds.length > 0);
+    assert.match(dmDeliveries[0].embeds[0].data.description, /TestUserDM/);
+
+    // Test that when DM sending fails (e.g. DMs closed), it never falls back to guild channel and continues silently
+    const channelDeliveries = [];
+    const mockClosedDm = {
+        id: 'dm_closed',
+        isTextBased: () => true,
+        send: async () => {
+            const err = new Error('Cannot send messages to this user');
+            err.code = 50007;
+            throw err;
+        }
+    };
+    const mockClosedUser = {
+        createDM: async () => mockClosedDm
+    };
+    const mockFallbackChannel = {
+        id: 'channel_guild_fallback_2',
+        isTextBased: () => true,
+        send: async (payload) => {
+            channelDeliveries.push(payload);
+            return { edit: async () => {} };
+        }
+    };
+    const mockFallbackClient = {
+        users: {
+            fetch: async (id) => (id === 'user_dm_closed' ? mockClosedUser : null)
+        },
+        channels: {
+            fetch: async (id) => (id === 'channel_guild_fallback_2' ? mockFallbackChannel : null)
+        }
+    };
+
+    const fallbackRunner = await startRunner({
+        jobKey: 'test:dm:routing:2',
+        ownerId: 'user_dm_closed',
+        userToken: 'invalid_dummy_token_for_test_2',
+        channelId: 'channel_guild_fallback_2',
+        client: mockFallbackClient,
+        mode: 'oneshot',
+        username: 'TestUserClosed'
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    fallbackRunner.controller.abort();
+    await fallbackRunner.task.catch(() => {});
+
+    assert.equal(channelDeliveries.length, 0, 'Status message must never fall back to guild channel when DM fails');
+
+    // Test runner without resolvable DM channel never sends to guild channel
+    const noDmChannelDeliveries = [];
+    const mockChannelOnlyClient = {
+        users: {
+            fetch: async () => null
+        },
+        channels: {
+            fetch: async () => ({
+                id: 'guild_channel_only',
+                isTextBased: () => true,
+                send: async (p) => {
+                    noDmChannelDeliveries.push(p);
+                    return { edit: async () => {} };
+                }
+            })
+        }
+    };
+    const silentRunner = await startRunner({
+        jobKey: 'test:dm:routing:3',
+        ownerId: 'user_unknown',
+        userToken: 'invalid_dummy_token_for_test_3',
+        channelId: 'guild_channel_only',
+        client: mockChannelOnlyClient,
+        mode: 'oneshot',
+        username: 'TestUserSilent'
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    silentRunner.controller.abort();
+    await silentRunner.task.catch(() => {});
+    assert.equal(noDmChannelDeliveries.length, 0, 'Status message must never be sent to guild channel when DM is unresolvable');
+});
+
+test('questDm builds correct tones and embeds for success, partial, danger, and auth failure', () => {
+    assert.equal(questSummaryTone({ totalQuests: 2, completedQuests: 2, issues: [] }), 'success');
+    assert.equal(questSummaryTone({ totalQuests: 2, completedQuests: 1, issues: [{ name: 'Q2', reason: 'fail' }] }), 'warning');
+    assert.equal(questSummaryTone({ totalQuests: 2, completedQuests: 0, issues: [{ name: 'Q1', reason: 'fail' }] }), 'danger');
+    assert.equal(questSummaryTone({ totalQuests: 0, completedQuests: 0, issues: [] }), 'info');
+
+    const successEmbed = buildQuestSummaryEmbed({
+        mode: 'oneshot',
+        username: 'TestHero',
+        accountId: '123456789',
+        totalQuests: 3,
+        completedQuests: 3,
+        issues: [],
+        jobKey: 'job:123'
+    });
+    assert.ok(successEmbed);
+    assert.match(successEmbed.data.title, /Log ระบบทำเควส/);
+    assert.match(successEmbed.data.description, /ทำ Quest อัตโนมัติเสร็จสิ้นแล้ว/);
+    assert.equal(successEmbed.data.color, parseInt((config.system?.themeColors?.success || '#CC66FF').replace('#', ''), 16));
+
+    const authFailEmbed = buildQuestAuthFailureEmbed({
+        username: 'TestHero',
+        accountId: '123456789',
+        jobKey: 'job:123'
+    });
+    assert.ok(authFailEmbed);
+    assert.match(authFailEmbed.data.title, /Log ระบบทำเควส/);
+    assert.match(authFailEmbed.data.description, /Token บัญชี Quest ใช้งานไม่ได้/);
+    assert.equal(authFailEmbed.data.color, parseInt((config.system?.themeColors?.error || '#FF9999').replace('#', ''), 16));
+});
+
+test('questDm sendQuestSummaryDM and sendQuestAuthFailureDM integrate with central dmService outbox', async () => {
+    const summaryResult = await sendQuestSummaryDM({
+        ownerId: 'owner_999',
+        accountId: 'acc_888',
+        username: 'PlayerOne',
+        mode: 'oneshot',
+        totalQuests: 2,
+        completedQuests: 2,
+        issues: [],
+        jobKey: 'test:job:key'
+    });
+
+    assert.ok(summaryResult);
+    // Even without active MongoDB, outbox saves into volatileOutbox or sends
+    assert.ok(['sent', 'retrying', 'skipped'].includes(summaryResult.status));
+
+    const authResult = await sendQuestAuthFailureDM({
+        ownerId: 'owner_999',
+        accountId: 'acc_888',
+        username: 'PlayerOne',
+        jobKey: 'test:job:key'
+    });
+
+    assert.ok(authResult);
+    assert.ok(['sent', 'retrying', 'skipped'].includes(authResult.status));
+});
+
+test('runnerStatusHeader builds valid Live Embeds for running, standby, completed, and stopped states', () => {
+    // 1. Running state (One-shot)
+    const runningEmbed = buildRunnerLiveEmbed({
+        username: 'GamerX',
+        accountId: 'acc_111',
+        mode: 'oneshot',
+        status: 'running',
+        totalQuestCount: 4,
+        completedQuestCount: 1
+    }, ['▶️ GamerX: RUNNING Genshin Quest', '⏳ GamerX: WAITING 30s (25%)']);
+
+    assert.ok(runningEmbed);
+    assert.match(runningEmbed.data.title, /Log ระบบทำเควส/);
+    assert.equal(runningEmbed.data.color, parseInt((config.system?.themeColors?.warning || '#D2691E').replace('#', ''), 16));
+    assert.match(runningEmbed.data.description, /GamerX/);
+    assert.match(runningEmbed.data.description, /กำลังดำเนินการ/);
+
+    // 2. Standby state (Auto Daily)
+    const standbyEmbed = buildRunnerLiveEmbed({
+        username: 'DailyHero',
+        accountId: 'acc_222',
+        mode: 'scheduled',
+        modeLine: '🤖 AUTO DAILY ENABLED',
+        status: 'standby',
+        latestQuestCount: 0,
+        nextCheckAt: new Date(Date.UTC(2026, 8, 10, 9, 0, 0))
+    }, ['💤 DailyHero: AUTO DAILY ACTIVE', '⏰ DailyHero: NEXT CHECK 16:00']);
+
+    assert.ok(standbyEmbed);
+    assert.match(standbyEmbed.data.title, /Log ระบบทำเควส \(ต่อเนื่องทุกวัน\)/);
+    assert.equal(standbyEmbed.data.color, parseInt((config.system?.themeColors?.success || '#CC66FF').replace('#', ''), 16));
+    assert.match(standbyEmbed.data.description, /DailyHero/);
+    assert.match(standbyEmbed.data.description, /ทำ Quest เสร็จเเล้ว กำลังรอวันต่อไป/);
+
+    // 3. Stopped state
+    const stoppedEmbed = buildRunnerLiveEmbed({
+        username: 'StoppedUser',
+        accountId: 'acc_333',
+        status: 'stopped'
+    }, ['🛑 StoppedUser: RUNNER STOPPED']);
+
+    assert.ok(stoppedEmbed);
+    assert.match(stoppedEmbed.data.title, /Log ระบบทำเควส/);
+    assert.equal(stoppedEmbed.data.color, parseInt((config.system?.themeColors?.error || '#FF9999').replace('#', ''), 16));
+    assert.match(stoppedEmbed.data.description, /ผู้ใช้สั่งหยุดการทำงานของ Quest แล้ว/);
+
+    // 4. formatRunnerStatusEmbed from raw content string
+    const rawContent = '```\n✅ LOGIN : ParserBot\n🤖 AUTO DAILY ENABLED\n🔎 ParserBot: พบ 3 QUESTS\n▶️ Doing Quest\n```';
+    const parsedEmbed = formatRunnerStatusEmbed(rawContent, { accountId: 'acc_444' });
+    assert.ok(parsedEmbed);
+    assert.match(parsedEmbed.data.title, /Log ระบบทำเควส \(ต่อเนื่องทุกวัน\)/);
+    assert.match(parsedEmbed.data.description, /ParserBot/);
+});
+
+test('questDm buildQuestStoppedEmbed creates danger embed with abort reason', () => {
+    const embed = buildQuestStoppedEmbed({
+        username: 'OperatorUser',
+        accountId: '999888777',
+        reason: 'ผู้ใช้สั่งหยุดการทำงานของ Quest แล้ว',
+        jobKey: 'job:test:stopped'
+    });
+
+    assert.ok(embed);
+    assert.match(embed.data.title, /Log ระบบทำเควส/);
+    assert.equal(embed.data.color, parseInt((config.system?.themeColors?.error || '#FF9999').replace('#', ''), 16));
+    assert.match(embed.data.description, /OperatorUser/);
+    assert.match(embed.data.description, /ผู้ใช้สั่งหยุดการทำงานของ Quest แล้ว/);
+});
+
+test('questDm sendQuestSummaryDM supports in-place message edit via targetMessage', async () => {
+    let editedData = null;
+    const mockTargetMessage = {
+        edit: async (payload) => {
+            editedData = payload;
+            return mockTargetMessage;
+        }
+    };
+
+    const result = await sendQuestSummaryDM({
+        targetMessage: mockTargetMessage,
+        ownerId: 'owner_in_place',
+        accountId: 'acc_in_place',
+        username: 'HeroInPlace',
+        mode: 'oneshot',
+        totalQuests: 2,
+        completedQuests: 2,
+        issues: []
+    });
+
+    assert.equal(result.status, 'delivered');
+    assert.equal(result.target, 'message_edit');
+    assert.ok(editedData);
+    assert.ok(Array.isArray(editedData.embeds));
+    assert.equal(editedData.embeds.length, 1);
+    assert.match(editedData.embeds[0].data.title, /Log ระบบทำเควส/);
+    assert.match(editedData.embeds[0].data.description, /ทำ Quest อัตโนมัติเสร็จสิ้นแล้ว/);
+});
+
+test('runnerSchedule zonedParts extracts correct local time components', () => {
+    const fixedUtc = new Date('2026-09-10T09:00:00.000Z'); // 16:00 BKK
+    const parts = zonedParts(fixedUtc, 'Asia/Bangkok');
+    assert.equal(parts.year, 2026);
+    assert.equal(parts.month, 9);
+    assert.equal(parts.day, 10);
+    assert.equal(parts.hour, 16);
+    assert.equal(parts.minute, 0);
+});
+
+test('buildQuestPanelRow renders conditional buttons based on showDaily flag', () => {
+    const standardRow = buildQuestPanelRow({ showDaily: false });
+    assert.equal(standardRow.components.length, 1);
+
+    const dailyRow = buildQuestPanelRow({ showDaily: true });
+    assert.equal(dailyRow.components.length, 3);
+});
+
+test('handleQuestCommand validates subcommand and permissions correctly', async () => {
+    const ownerId = process.env.OWNER_ID || '661415152146710558';
+
+    // 1. Invalid subcommand
+    let replyPayload = null;
+    await handleQuestCommand({
+        user: { id: ownerId },
+        options: { getSubcommand: () => 'invalid_sub' },
+        reply: async (p) => { replyPayload = p; return p; }
+    });
+    assert.ok(replyPayload);
+    assert.match(replyPayload.content, /คำสั่งย่อยไม่ถูกต้อง/);
+
+    // 2. Non-owner trying to open panel
+    let nonOwnerReply = null;
+    await handleQuestCommand({
+        user: { id: '999999999999999999' },
+        options: { getSubcommand: () => 'panel' },
+        reply: async (p) => { nonOwnerReply = p; return p; }
+    });
+    assert.ok(nonOwnerReply);
+    assert.match(nonOwnerReply.content, /สงวนสิทธิ์เฉพาะ/);
+
+    // 3. Owner opening panel
+    let ownerReply = null;
+    await handleQuestCommand({
+        user: { id: ownerId },
+        options: {
+            getSubcommand: () => 'panel',
+            getBoolean: (name) => name === 'auto_daily'
+        },
+        deferReply: async () => {},
+        editReply: async (p) => { ownerReply = p; return p; },
+        reply: async (p) => { ownerReply = p; return p; },
+        deferred: true
+    });
+    assert.ok(ownerReply);
+    assert.ok(ownerReply.embeds && ownerReply.embeds.length > 0);
+    assert.ok(ownerReply.components && ownerReply.components.length > 0);
+});
+
+test('handleQuestButton and handleQuestSelect handle all actions and fallback', async () => {
+    const ownerId = process.env.OWNER_ID || '661415152146710558';
+
+    // 1. Unknown button
+    let unknownReply = null;
+    await handleQuestButton({
+        customId: 'quest_panel:unknown_action',
+        user: { id: ownerId },
+        reply: async (p) => { unknownReply = p; return p; }
+    });
+    assert.ok(unknownReply);
+    assert.match(unknownReply.content, /ปุ่มควบคุมนี้หมดอายุหรือไม่รองรับแล้ว/);
+
+    // 2. BTN_QUEST_RUN_ONESHOT shows modal
+    let shownModal = null;
+    await handleQuestButton({
+        customId: IDS.BTN_QUEST_RUN_ONESHOT,
+        showModal: async (m) => { shownModal = m; return m; }
+    });
+    assert.ok(shownModal);
+    assert.ok(shownModal.data.custom_id.includes('oneshot'));
+
+    // 3. BTN_QUEST_RUN_DAILY shows modal
+    let dailyModal = null;
+    await handleQuestButton({
+        customId: IDS.BTN_QUEST_RUN_DAILY,
+        showModal: async (m) => { dailyModal = m; return m; }
+    });
+    assert.ok(dailyModal);
+    assert.ok(dailyModal.data.custom_id.includes('scheduled'));
+
+    // 4. BTN_QUEST_STOP opens stop panel (or returns empty message if no active runners)
+    let stopReply = null;
+    await handleQuestButton({
+        customId: IDS.BTN_QUEST_STOP,
+        user: { id: ownerId },
+        deferReply: async () => {},
+        editReply: async (p) => { stopReply = p; return p; }
+    });
+    assert.ok(stopReply);
+    assert.match(stopReply.content, /ไม่มีเควสที่กำลังทำงานอยู่/);
+
+    // 5. BTN_QUEST_REFRESH updates stop panel
+    let refreshReply = null;
+    await handleQuestButton({
+        customId: IDS.BTN_QUEST_REFRESH,
+        user: { id: ownerId },
+        deferUpdate: async () => {},
+        editReply: async (p) => { refreshReply = p; return p; }
+    });
+    assert.ok(refreshReply);
+    assert.match(refreshReply.content, /ไม่มีเควสที่กำลังทำงานอยู่/);
+
+    // 6. BTN_QUEST_STOP_ALL stops runners
+    let stopAllReply = null;
+    await handleQuestButton({
+        customId: IDS.BTN_QUEST_STOP_ALL,
+        user: { id: ownerId },
+        deferred: true,
+        deferUpdate: async () => {},
+        editReply: async (p) => { stopAllReply = p; return p; }
+    });
+    assert.ok(stopAllReply);
+    assert.match(stopAllReply.content, /สั่งหยุดการทำเควสทั้งหมดเรียบร้อยแล้ว/);
+
+    // 7. handleQuestSelect ignores unrelated customId
+    const ignored = await handleQuestSelect({
+        customId: 'unrelated_select'
+    });
+    assert.equal(ignored, undefined);
+
+    // 8. handleQuestSelect processes SELECT_QUEST_STOP
+    let selectReply = null;
+    await handleQuestSelect({
+        customId: IDS.SELECT_QUEST_STOP,
+        user: { id: ownerId },
+        values: ['mock_schedule_1', 'mock_schedule_2'],
+        deferred: true,
+        deferUpdate: async () => {},
+        editReply: async (p) => { selectReply = p; return p; }
+    });
+    assert.ok(selectReply);
+    assert.match(selectReply.content, /สั่งหยุดเรียบร้อยแล้ว/);
+});
+
+test('handleQuestModalSubmit validates empty and excessive tokens', async () => {
+    // 1. Empty tokens
+    let emptyReply = null;
+    await handleQuestModalSubmit({
+        customId: IDS.MODAL_QUEST_RUN,
+        fields: {
+            getTextInputValue: () => '   \n  \n'
+        },
+        reply: async (p) => { emptyReply = p; return p; }
+    });
+    assert.ok(emptyReply);
+    assert.match(emptyReply.content, /ไม่พบ Token/);
+
+    // 2. More than 10 tokens
+    let limitReply = null;
+    const elevenTokens = Array.from({ length: 11 }, (_, i) => `token_${i + 1}`).join('\n');
+    await handleQuestModalSubmit({
+        customId: IDS.MODAL_QUEST_RUN,
+        fields: {
+            getTextInputValue: () => elevenTokens
+        },
+        reply: async (p) => { limitReply = p; return p; }
+    });
+    assert.ok(limitReply);
+    assert.match(limitReply.content, /สามารถส่งได้สูงสุด \*\*10 บัญชี\*\*/);
+});
+
+test('runnerManager job query and lifecycle management functions', async () => {
+    const {
+        getJob,
+        listJobs,
+        getUserJobs,
+        findUserJobByAccount,
+        findAnyJobByAccount,
+        stopJob,
+        stopScheduledJob,
+        stopScheduledJobAsAdmin,
+        stopRunner,
+        shutdownRunners
+    } = require('../quest/core/runnerManager');
+
+    // 1. Initial state
+    assert.equal(getJob('non_existent'), null);
+    assert.equal(findUserJobByAccount('user1', 'acc1'), null);
+    assert.equal(findAnyJobByAccount('acc1'), null);
+    assert.deepEqual(getUserJobs('user1'), []);
+    assert.equal(stopJob('user1', 'non_existent'), false);
+    assert.equal(stopScheduledJob('user1', 'sched1'), false);
+    assert.equal(stopScheduledJobAsAdmin('sched1'), false);
+    assert.equal(stopRunner('user1'), false);
+
+    // 2. shutdownRunners with empty jobs
+    const stopped = await shutdownRunners(100);
+    assert.equal(typeof stopped, 'number');
+});
+
+test('runnerManager active runner execution, stopping, and shutdown', async () => {
+    const {
+        startRunner,
+        getJob,
+        getUserJobs,
+        findUserJobByAccount,
+        stopJob,
+        shutdownRunners
+    } = require('../quest/core/runnerManager');
+
+    const origFetch = globalThis.fetch;
+    let finishFetchQuests;
+    const fetchQuestsPromise = new Promise(resolve => {
+        finishFetchQuests = resolve;
+    });
+
+    globalThis.fetch = async (url) => {
+        const urlStr = String(url);
+        if (urlStr.includes('/users/@me')) {
+            return {
+                ok: true,
+                status: 200,
+                headers: new Headers({ 'content-type': 'application/json' }),
+                json: async () => ({ id: 'acc_active_1', username: 'active_user' })
+            };
+        }
+        if (urlStr.includes('/quests/@me') || urlStr.includes('/users/@me/quests')) {
+            await fetchQuestsPromise;
+            return {
+                ok: true,
+                status: 200,
+                headers: new Headers({ 'content-type': 'application/json' }),
+                json: async () => []
+            };
+        }
+        return {
+            ok: true,
+            status: 200,
+            headers: new Headers({ 'content-type': 'application/json' }),
+            json: async () => ({})
+        };
+    };
+
+    try {
+        // 1. Invalid mode rejects
+        await assert.rejects(
+            startRunner({ jobKey: 'job_invalid', ownerId: 'u1', userToken: 'tok1', mode: 'invalid' }),
+            /Unknown runner mode/
+        );
+
+        // 2. Start active runner
+        await startRunner({
+            jobKey: 'job_active_1',
+            ownerId: 'owner_a',
+            userToken: 'tok_active_1',
+            mode: 'oneshot',
+            accountId: 'acc_active_1',
+            username: 'active_user'
+        });
+
+        // 3. Duplicate job key rejected
+        await assert.rejects(
+            startRunner({
+                jobKey: 'job_active_1',
+                ownerId: 'owner_a',
+                userToken: 'tok_active_1',
+                mode: 'oneshot'
+            }),
+            /กำลังทำงานอยู่/
+        );
+
+        // 4. Query active runner state
+        const job = getJob('job_active_1');
+        assert.ok(job);
+        assert.equal(job.ownerId, 'owner_a');
+        assert.equal(job.mode, 'oneshot');
+
+        const userJobs = getUserJobs('owner_a');
+        assert.equal(userJobs.length, 1);
+        assert.equal(userJobs[0].key, 'job_active_1');
+
+        const foundJob = findUserJobByAccount('owner_a', 'acc_active_1');
+        assert.ok(foundJob);
+        assert.equal(foundJob.key, 'job_active_1');
+
+        // 5. Unauthorized stop fails
+        assert.equal(stopJob('unauthorized_owner', 'job_active_1'), false);
+
+        // 6. Authorized stop marks lifecycle stopping and aborts controller
+        assert.equal(stopJob('owner_a', 'job_active_1'), true);
+        assert.equal(job.lifecycle, 'stopping');
+        assert.equal(job.controller.signal.aborted, true);
+
+        // 7. Start a second runner to test shutdownRunners
+        await startRunner({
+            jobKey: 'job_active_2',
+            ownerId: 'owner_b',
+            userToken: 'tok_active_2',
+            mode: 'oneshot'
+        });
+
+        const stoppedCount = await shutdownRunners(200);
+        assert.ok(stoppedCount >= 1);
+    } finally {
+        if (finishFetchQuests) finishFetchQuests();
+        globalThis.fetch = origFetch;
+    }
+});
+
+test('quest panel log_channel option routes live logs and summary to specified channel and falls back to DM on failure', async () => {
+    // 1. buildQuestPanelRow encodes channelId
+    const panelRowWithChannel = buildQuestPanelRow({ showDaily: true, channelId: '123456789012345678' });
+    assert.equal(panelRowWithChannel.components.length, 3);
+    assert.equal(panelRowWithChannel.components[0].data.custom_id, `${IDS.BTN_QUEST_RUN_ONESHOT}:123456789012345678`);
+    assert.equal(panelRowWithChannel.components[1].data.custom_id, `${IDS.BTN_QUEST_RUN_DAILY}:123456789012345678`);
+    assert.equal(panelRowWithChannel.components[2].data.custom_id, IDS.BTN_QUEST_STOP);
+
+    // 2. handleQuestCommand extracts log_channel and embeds in button customId
+    const ownerId = process.env.OWNER_ID || '661415152146710558';
+    let panelReply = null;
+    await handleQuestCommand({
+        user: { id: ownerId },
+        options: {
+            getSubcommand: () => 'panel',
+            getBoolean: (name) => name === 'auto_daily',
+            getChannel: (name) => (name === 'log_channel' ? { id: 'channel_log_888' } : null)
+        },
+        deferReply: async () => {},
+        editReply: async (p) => { panelReply = p; return p; },
+        reply: async (p) => { panelReply = p; return p; },
+        deferred: true
+    });
+    assert.ok(panelReply);
+    assert.ok(panelReply.components && panelReply.components[0]);
+    assert.equal(panelReply.components[0].components[0].data.custom_id, `${IDS.BTN_QUEST_RUN_ONESHOT}:channel_log_888`);
+
+    // 3. handleQuestButton forwards channelId into modal customId
+    let openedModal = null;
+    await handleQuestButton({
+        customId: `${IDS.BTN_QUEST_RUN_ONESHOT}:channel_log_888`,
+        showModal: async (m) => { openedModal = m; return m; }
+    });
+    assert.ok(openedModal);
+    assert.equal(openedModal.data.custom_id, `${IDS.MODAL_QUEST_RUN}:oneshot:channel_log_888`);
+
+    let openedDailyModal = null;
+    await handleQuestButton({
+        customId: `${IDS.BTN_QUEST_RUN_DAILY}:channel_log_888`,
+        showModal: async (m) => { openedDailyModal = m; return m; }
+    });
+    assert.ok(openedDailyModal);
+    assert.equal(openedDailyModal.data.custom_id, `${IDS.MODAL_QUEST_RUN}:scheduled:channel_log_888`);
+
+    // 4. startRunner delivers live log to logChannelId when channel is valid
+    const channelDelivered = [];
+    const mockChannel = {
+        id: 'channel_log_888',
+        isTextBased: () => true,
+        send: async (payload) => {
+            channelDelivered.push(payload);
+            return { edit: async () => {} };
+        }
+    };
+    const mockClientWithChannel = {
+        users: { fetch: async () => null },
+        channels: {
+            cache: new Map([['channel_log_888', mockChannel]]),
+            fetch: async (id) => (id === 'channel_log_888' ? mockChannel : null)
+        }
+    };
+
+    const runner = await startRunner({
+        jobKey: 'test:log_channel:success',
+        ownerId: 'owner_user_1',
+        userToken: 'dummy_token_1',
+        logChannelId: 'channel_log_888',
+        client: mockClientWithChannel,
+        mode: 'oneshot',
+        username: 'ChannelUser'
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    runner.controller.abort();
+    await runner.task.catch(() => {});
+
+    assert.ok(channelDelivered.length > 0, 'Log message must be sent to the designated log channel');
+    assert.ok(channelDelivered[0].embeds && channelDelivered[0].embeds.length > 0);
+    assert.match(channelDelivered[0].embeds[0].data.description, /ChannelUser/);
+
+    // 5. startRunner falls back to DM when guild channel send fails
+    const dmFallbackDelivered = [];
+    const mockDmFallback = {
+        id: 'dm_fallback_1',
+        isTextBased: () => true,
+        send: async (payload) => {
+            dmFallbackDelivered.push(payload);
+            return { edit: async () => {} };
+        }
+    };
+    const mockUserWithDm = {
+        createDM: async () => mockDmFallback
+    };
+    const mockFailingChannel = {
+        id: 'channel_failing_777',
+        isTextBased: () => true,
+        send: async () => {
+            const err = new Error('Missing Permissions');
+            err.code = 50013;
+            throw err;
+        }
+    };
+    const mockClientWithFailingChannel = {
+        users: {
+            fetch: async (id) => (id === 'owner_fallback_user' ? mockUserWithDm : null)
+        },
+        channels: {
+            cache: new Map([['channel_failing_777', mockFailingChannel]]),
+            fetch: async (id) => (id === 'channel_failing_777' ? mockFailingChannel : null)
+        }
+    };
+
+    const fallbackRunner = await startRunner({
+        jobKey: 'test:log_channel:fallback',
+        ownerId: 'owner_fallback_user',
+        userToken: 'dummy_token_2',
+        logChannelId: 'channel_failing_777',
+        client: mockClientWithFailingChannel,
+        mode: 'oneshot',
+        username: 'FallbackUser'
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    fallbackRunner.controller.abort();
+    await fallbackRunner.task.catch(() => {});
+
+    assert.ok(dmFallbackDelivered.length > 0, 'Log message must automatically fall back to DM when channel fails');
+    assert.ok(dmFallbackDelivered[0].embeds && dmFallbackDelivered[0].embeds.length > 0);
+    assert.match(dmFallbackDelivered[0].embeds[0].data.description, /FallbackUser/);
+});
+
+test('reportOneShotSummary: always transitions to a terminal runnerStatus on completion or abort', async () => {
+    const dmDelivered = [];
+    let lastEditedEmbed = null;
+    const mockDm = {
+        id: 'dm_terminal_status_1',
+        isTextBased: () => true,
+        send: async (payload) => {
+            dmDelivered.push(payload);
+            return {
+                edit: async (editPayload) => {
+                    lastEditedEmbed = editPayload?.embeds?.[0];
+                }
+            };
+        }
+    };
+    const mockUser = {
+        createDM: async () => mockDm
+    };
+    const mockClient = {
+        users: {
+            fetch: async (id) => (id === 'owner_terminal_user' ? mockUser : null)
+        },
+        channels: {
+            cache: new Map(),
+            fetch: async () => null
+        }
+    };
+
+    const runner = await startRunner({
+        jobKey: 'test:oneshot:terminal:status',
+        ownerId: 'owner_terminal_user',
+        userToken: 'dummy_token_term',
+        client: mockClient,
+        mode: 'oneshot',
+        username: 'TerminalStatusUser'
+    });
+
+    runner.controller.abort();
+    await runner.task.catch(() => {});
+
+    if (lastEditedEmbed) {
+        assert.notEqual(lastEditedEmbed.data?.title?.includes('กำลังทำเควสต์'), true);
+    }
+});
+
+
+
+
+

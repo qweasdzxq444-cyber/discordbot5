@@ -1,0 +1,529 @@
+"use strict";
+
+const GuildConfig = require("./models/GuildConfig");
+const IpIdentityLink = require("./models/IpIdentityLink");
+const VerifyLog = require("./models/VerifyLog");
+const safeLogger = require("./utils/safeLogger");
+const { safeError } = safeLogger;
+const {
+    cleanupSnapshotGarbage,
+    getSnapshotCleanupConfig
+} = require("./services/snapshotCleanup");
+const oauthTokenManager = require("../tokens/oauthTokenManager");
+const {
+    runAutomaticMigration,
+    config: getAutomaticMigrationConfig
+} = require("./services/automaticMigration");
+const {
+    migrateLegacyHistory,
+    migrateVerifyLogHistory
+} = require("./services/ipIdentityHistoryService");
+const { runEncryptionMigration } = require("./services/encryptionMigration");
+const {
+    startLookupCacheCleanup,
+    stopLookupCacheCleanup
+} = require("./utils/ipUtils");
+const { readFiniteInteger } = require("../core/numbers");
+const { sendWebhookEvent } = require("../core/webhooks");
+const { verificationWebhookManager } = require("./services/webhook/verificationWebhookManager");
+const { recoverPendingPrivacyDeletions } = require("./services/privacyDeletion");
+
+const RETENTION_CONFIG_SCAN_MAX = readFiniteInteger(process.env.RETENTION_CONFIG_SCAN_MAX, { fallback: 1000, min: 50, max: 10000 });
+const RETENTION_ERROR_MAX = readFiniteInteger(process.env.RETENTION_ERROR_MAX, { fallback: 50, min: 5, max: 1000 });
+const MAINTENANCE_INTERVAL_MS = 60 * 60 * 1000;
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+let maintenanceTimer = null;
+let maintenanceClearInterval = clearInterval;
+let runtimeStartPromise = null;
+let maintenanceInFlight = false;
+let lastRunAt = null;
+let lastStartedAt = null;
+let lastFinishedAt = null;
+let lastSuccessAt = null;
+let lastDurationMs = null;
+let lastError = null;
+let lastSummary = null;
+let lastOAuthRefreshAt = null;
+let lastOAuthRefreshError = null;
+let lastOAuthRefreshSummary = null;
+let privacyDeletionRecoveryInFlight = false;
+let lastPrivacyDeletionRecoveryAt = null;
+let lastPrivacyDeletionRecoveryError = null;
+let lastPrivacyDeletionRecoverySummary = null;
+let runCount = 0;
+let failCount = 0;
+let maintenanceWaiters = [];
+let retentionCursor = null;
+let lastAutomaticMigrationAt = null;
+let lastAutomaticMigrationError = null;
+let lastAutomaticMigrationSummary = null;
+
+function resolveMaintenanceWaiters() {
+    if (maintenanceInFlight) return;
+    const waiters = maintenanceWaiters;
+    maintenanceWaiters = [];
+    for (const resolve of waiters) resolve();
+}
+
+function waitForMaintenanceIdle() {
+    if (!maintenanceInFlight) return Promise.resolve();
+    return new Promise(resolve => maintenanceWaiters.push(resolve));
+}
+
+function retentionDays(mode) {
+    const value = String(mode || "").toLowerCase();
+    if (["30d", "rolling_30d", "delete_after_30d"].includes(value)) return 30;
+    if (["90d", "rolling_90d", "delete_after_90d"].includes(value)) return 90;
+    if (["180d", "rolling_180d", "delete_after_180d"].includes(value)) return 180;
+    return null;
+}
+
+function createSummary(dryRun, now) {
+    return {
+        dryRun,
+        skipped: false,
+        startedAt: now,
+        finishedAt: null,
+        guildsScanned: 0,
+        guildsWithRetention: 0,
+        retentionCursorWrapped: false,
+        verifyLogs: 0,
+        ipIdentityLinks: 0,
+        snapshotCleanup: null,
+        encryptionMigration: null,
+        automaticMigration: null,
+        ipIdentityHistoryMigration: null,
+        ipIdentityVerifyLogMigration: null,
+        errors: []
+    };
+}
+
+async function runEncryptionMigrationSafe(dryRun, summary) {
+    try {
+        summary.encryptionMigration = await runEncryptionMigration({
+            dryRun,
+            countRemaining: dryRun
+        });
+    } catch (err) {
+        const error = safeError(err);
+        summary.encryptionMigration = { failed: true, error };
+        summary.errors.push({ subsystem: "encryption_migration", error });
+    }
+}
+
+async function runAutomaticMigrationSafe(dryRun, summary) {
+    try {
+        summary.automaticMigration = await runAutomaticMigration({ dryRun });
+        if (!dryRun) {
+            lastAutomaticMigrationAt = Date.now();
+            lastAutomaticMigrationSummary = summary.automaticMigration;
+            lastAutomaticMigrationError = null;
+        }
+    } catch (err) {
+        const error = safeError(err);
+        summary.automaticMigration = { failed: true, error };
+        summary.errors.push({ subsystem: "automatic_migration", error });
+        if (!dryRun) {
+            lastAutomaticMigrationAt = Date.now();
+            lastAutomaticMigrationError = error;
+        }
+    }
+}
+
+async function runSnapshotCleanup(dryRun, summary) {
+    try {
+        summary.snapshotCleanup = await cleanupSnapshotGarbage({ dryRun });
+    } catch (err) {
+        summary.snapshotCleanup = {
+            mode: "permanent_history",
+            dryRun,
+            failed: true,
+            error: safeError(err)
+        };
+        summary.errors.push({ subsystem: "snapshot_cleanup", error: safeError(err) });
+    }
+}
+
+async function runIpIdentityHistoryMigration(dryRun, summary) {
+    if (dryRun) {
+        summary.ipIdentityHistoryMigration = { skipped: true, reason: "dry_run" };
+        return;
+    }
+    try {
+        summary.ipIdentityHistoryMigration = await migrateLegacyHistory();
+    } catch (err) {
+        const error = safeError(err);
+        summary.ipIdentityHistoryMigration = { failed: true, error };
+        summary.errors.push({ subsystem: "ip_identity_history_migration", error });
+    }
+}
+
+async function runIpIdentityVerifyLogMigration(dryRun, summary) {
+    if (dryRun) {
+        summary.ipIdentityVerifyLogMigration = { skipped: true, reason: "dry_run" };
+        return;
+    }
+    try {
+        summary.ipIdentityVerifyLogMigration = await migrateVerifyLogHistory();
+    } catch (err) {
+        const error = safeError(err);
+        summary.ipIdentityVerifyLogMigration = { failed: true, error };
+        summary.errors.push({ subsystem: "ip_identity_verify_log_migration", error });
+    }
+}
+
+async function loadRetentionConfigs(dryRun, summary) {
+    const filter = !dryRun && retentionCursor
+        ? { _id: { $gt: retentionCursor } }
+        : {};
+    let configs = await GuildConfig.find(filter)
+        .select("guildId security.retentionMode")
+        .sort({ _id: 1 })
+        .limit(RETENTION_CONFIG_SCAN_MAX)
+        .lean();
+
+    if (!dryRun && retentionCursor && configs.length === 0) {
+        retentionCursor = null;
+        summary.retentionCursorWrapped = true;
+        configs = await GuildConfig.find({})
+            .select("guildId security.retentionMode")
+            .sort({ _id: 1 })
+            .limit(RETENTION_CONFIG_SCAN_MAX)
+            .lean();
+    }
+
+    if (!dryRun) {
+        retentionCursor = configs.length >= RETENTION_CONFIG_SCAN_MAX
+            ? configs.at(-1)?._id || null
+            : null;
+    }
+    return configs;
+}
+
+function retentionFilters(guildId, cutoff) {
+    return {
+        verify: {
+            guildId,
+            deletedAt: { $exists: false },
+            $or: [
+                { verifiedAt: { $lt: cutoff } },
+                { createdAt: { $lt: cutoff } }
+            ]
+        },
+        identity: {
+            guildId,
+            deletedAt: { $exists: false },
+            lastSeenAt: { $lt: cutoff }
+        }
+    };
+}
+
+async function processGuildRetention(config, { now, dryRun, summary }) {
+    const mode = config.security?.retentionMode;
+    const days = retentionDays(mode);
+    if (!days) return;
+
+    summary.guildsWithRetention++;
+    const filters = retentionFilters(config.guildId, now - days * DAY_MS);
+
+    try {
+        if (dryRun) {
+            const [verifyLogs, ipIdentityLinks] = await Promise.all([
+                VerifyLog.countDocuments(filters.verify),
+                IpIdentityLink.countDocuments(filters.identity)
+            ]);
+            summary.verifyLogs += verifyLogs;
+            summary.ipIdentityLinks += ipIdentityLinks;
+            return;
+        }
+
+        const deletedBy = `retention:${mode || "unknown"}`;
+        const [verifyLogs, ipIdentityLinks] = await Promise.all([
+            VerifyLog.updateMany(filters.verify, {
+                $set: { deletedAt: now, deletedBy }
+            }),
+            IpIdentityLink.updateMany(filters.identity, {
+                $set: { deletedAt: now, deletedBy, updatedAt: now }
+            })
+        ]);
+        summary.verifyLogs += verifyLogs.modifiedCount || 0;
+        summary.ipIdentityLinks += ipIdentityLinks.modifiedCount || 0;
+    } catch (err) {
+        summary.errors.push({
+            guildId: config.guildId,
+            retentionMode: mode || "unknown",
+            error: safeError(err)
+        });
+        if (summary.errors.length > RETENTION_ERROR_MAX) {
+            summary.errors.splice(0, summary.errors.length - RETENTION_ERROR_MAX);
+        }
+    }
+}
+
+async function runPrivacyDeletionRecoverySafe(options = {}) {
+    if (privacyDeletionRecoveryInFlight) {
+        return { skipped: true, reason: "in_flight" };
+    }
+    privacyDeletionRecoveryInFlight = true;
+    try {
+        const recoveryFn = options.recoverPendingPrivacyDeletionsFn || recoverPendingPrivacyDeletions;
+        const result = await recoveryFn(options.privacyDeletionOptions || {});
+        lastPrivacyDeletionRecoveryAt = Date.now();
+        lastPrivacyDeletionRecoverySummary = {
+            recoveredCount: Array.isArray(result) ? result.length : 0,
+            jobs: Array.isArray(result) ? result : []
+        };
+        lastPrivacyDeletionRecoveryError = null;
+        return lastPrivacyDeletionRecoverySummary;
+    } catch (err) {
+        lastPrivacyDeletionRecoveryError = safeError(err);
+        console.error("[VERIFICATION] privacy deletion recovery failed:", lastPrivacyDeletionRecoveryError);
+        return { error: lastPrivacyDeletionRecoveryError };
+    } finally {
+        privacyDeletionRecoveryInFlight = false;
+    }
+}
+
+async function _runOAuthTokenRefresh() {
+    try {
+        lastOAuthRefreshSummary = await oauthTokenManager.refreshDueTokens();
+        lastOAuthRefreshAt = Date.now();
+        lastOAuthRefreshError = null;
+    } catch (err) {
+        lastOAuthRefreshError = safeError(err);
+    }
+}
+
+async function _runWebhookMaintenanceRecovery() {
+    if (typeof verificationWebhookManager?.performStartupRecovery === "function" && !verificationWebhookManager?.startupRecoveryCompleted) {
+        try {
+            await verificationWebhookManager.performStartupRecovery();
+        } catch (err) {
+            safeLogger.warn?.("[Lifecycle] Webhook startup recovery encountered error:", err?.message || String(err));
+        }
+    } else if (typeof verificationWebhookManager?.repo?.recoverStuckSendingDeliveries === "function") {
+        try {
+            const recovery = verificationWebhookManager.repo.recoverStuckSendingDeliveries(300000);
+            const stuckGuilds = Array.isArray(recovery?.guildIds) ? recovery.guildIds : [];
+            for (const gId of stuckGuilds) {
+                if (typeof verificationWebhookManager.triggerWorker === "function") {
+                    verificationWebhookManager.triggerWorker(gId);
+                }
+            }
+        } catch (err) {
+            safeLogger.warn?.("[Lifecycle] Webhook recoverStuckSendingDeliveries encountered error:", err?.message || String(err));
+        }
+    }
+}
+
+async function _runPostMaintenanceTasks(options, summary) {
+    summary.privacyDeletionRecovery = await runPrivacyDeletionRecoverySafe(options);
+    await _runOAuthTokenRefresh();
+    await _runWebhookMaintenanceRecovery();
+}
+
+async function _runMigrationsAndRetention(dryRun, summary, now) {
+    await runAutomaticMigrationSafe(dryRun, summary);
+    await runEncryptionMigrationSafe(dryRun, summary);
+    await runIpIdentityHistoryMigration(dryRun, summary);
+    await runIpIdentityVerifyLogMigration(dryRun, summary);
+    await runSnapshotCleanup(dryRun, summary);
+    const configs = await loadRetentionConfigs(dryRun, summary);
+    summary.guildsScanned = configs.length;
+    summary.truncated = configs.length >= RETENTION_CONFIG_SCAN_MAX;
+    summary.maxGuilds = RETENTION_CONFIG_SCAN_MAX;
+
+    for (const config of configs) {
+        await processGuildRetention(config, { now, dryRun, summary });
+    }
+}
+
+async function runVerificationMaintenance(options = {}) {
+    if (maintenanceInFlight) {
+        return { skipped: true, reason: "maintenance_in_flight" };
+    }
+
+    maintenanceInFlight = true;
+    const now = Date.now();
+    const dryRun = options.dryRun === true;
+    if (!dryRun) {
+        lastError = null;
+        lastStartedAt = now;
+    }
+    const summary = createSummary(dryRun, now);
+
+    try {
+        await _runMigrationsAndRetention(dryRun, summary, now);
+
+        if (!dryRun) {
+            await _runPostMaintenanceTasks(options, summary);
+        }
+
+        summary.finishedAt = Date.now();
+        summary.durationMs = summary.finishedAt - summary.startedAt;
+        if (!dryRun) {
+            lastFinishedAt = summary.finishedAt;
+            lastDurationMs = summary.durationMs;
+            lastRunAt = summary.finishedAt;
+            lastSuccessAt = summary.finishedAt;
+            lastSummary = summary;
+            runCount++;
+        }
+        return summary;
+    } catch (err) {
+        if (!dryRun) {
+            lastError = safeError(err);
+            lastFinishedAt = Date.now();
+            lastDurationMs = lastFinishedAt - now;
+            failCount++;
+        }
+        throw err;
+    } finally {
+        maintenanceInFlight = false;
+        resolveMaintenanceWaiters();
+    }
+}
+
+async function startVerificationRuntime(options = {}) {
+    if (runtimeStartPromise) return runtimeStartPromise;
+    if (maintenanceTimer) return getVerificationDiagnostics();
+    const tokenManager = options.oauthTokenManager || oauthTokenManager;
+    const maintenanceRunner = options.maintenanceRunner || runVerificationMaintenance;
+    const createInterval = options.setIntervalFn || setInterval;
+    maintenanceClearInterval = options.clearIntervalFn || clearInterval;
+    startLookupCacheCleanup();
+    runtimeStartPromise = (async () => {
+        await maintenanceRunner();
+        if (typeof verificationWebhookManager?.performStartupRecovery === "function") {
+            try {
+                await verificationWebhookManager.performStartupRecovery();
+            } catch (recoveryErr) {
+                console.error("[VERIFICATION] webhook startup recovery failed:", recoveryErr);
+            }
+        }
+        await runPrivacyDeletionRecoverySafe(options);
+        if (typeof tokenManager.start === "function") {
+            try {
+                await tokenManager.start();
+            } catch (err) {
+                lastError = safeError(err);
+                console.error("[VERIFICATION] token manager startup failed:", lastError);
+            }
+        }
+        if (!maintenanceTimer) {
+            maintenanceTimer = createInterval(async () => {
+                try {
+                    await maintenanceRunner();
+                } catch (err) {
+                    lastError = safeError(err);
+                    console.error("[VERIFICATION] maintenance failed:", lastError);
+                    try {
+                        await sendWebhookEvent({
+                            target: "ALERT",
+                            severity: "ERROR",
+                            category: "VERIFICATION",
+                            code: "verification.maintenance_failed",
+                            state: "OPEN",
+                            title: "MAINTENANCE FAILED",
+                            description: `การบำรุงรักษาระบบยืนยันตัวตนรอบปกติล้มเหลว: ${lastError}`,
+                            fields: [
+                                { name: "สถานะ", value: "OPEN" },
+                                { name: "ผลกระทบ", value: "การล้างข้อมูลเก่าหรืออัปเดตสิทธิ์ยืนยันตัวตนอาจล่าช้า" },
+                                { name: "สิ่งที่ควรทำ", value: "ตรวจสอบฐานข้อมูลและการเชื่อมต่อ Discord API" },
+                                { name: "รหัสข้อผิดพลาด", value: String(err?.code || err?.name || "maintenance_error") }
+                            ],
+                            dedupeKey: "verification-maintenance-failed",
+                            dedupeMs: 30 * 60 * 1000
+                        });
+                    } catch {
+                        // ignore webhook delivery failure in background maintenance
+                    }
+                }
+            }, MAINTENANCE_INTERVAL_MS);
+            maintenanceTimer.unref?.();
+        }
+        return getVerificationDiagnostics();
+    })().finally(() => {
+        runtimeStartPromise = null;
+    });
+    return runtimeStartPromise;
+}
+
+async function stopVerificationRuntime(options = {}) {
+    const tokenManager = options.oauthTokenManager || oauthTokenManager;
+    if (runtimeStartPromise) await runtimeStartPromise.catch(() => {});
+    if (maintenanceTimer) maintenanceClearInterval(maintenanceTimer);
+    maintenanceTimer = null;
+    maintenanceClearInterval = clearInterval;
+    stopLookupCacheCleanup();
+    if (typeof tokenManager.stop === "function") {
+        await tokenManager.stop();
+    }
+    await waitForMaintenanceIdle();
+}
+
+function getVerificationDiagnostics() {
+    let oauthRunStatus = "ok";
+    if (lastOAuthRefreshError) {
+        oauthRunStatus = "error";
+    } else if (lastOAuthRefreshSummary?.failed > 0 || lastOAuthRefreshSummary?.persistenceFailed > 0) {
+        oauthRunStatus = "partial_failure";
+    }
+
+    return {
+        ready: lastRunAt !== null && !lastError,
+        timerActive: !!maintenanceTimer,
+        inFlight: maintenanceInFlight,
+        lastRunAt,
+        lastStartedAt,
+        lastFinishedAt,
+        lastSuccessAt,
+        lastDurationMs,
+        runCount,
+        failCount,
+        lastError,
+        lastSummary,
+        privacyDeletionRecovery: {
+            lastRunAt: lastPrivacyDeletionRecoveryAt,
+            lastError: lastPrivacyDeletionRecoveryError,
+            lastSummary: lastPrivacyDeletionRecoverySummary
+        },
+        retentionCursor: retentionCursor ? String(retentionCursor) : null,
+        snapshotCleanup: {
+            config: getSnapshotCleanupConfig(),
+            lastSummary: lastSummary?.snapshotCleanup || null
+        },
+        automaticMigration: {
+            config: getAutomaticMigrationConfig(),
+            lastRunAt: lastAutomaticMigrationAt,
+            lastError: lastAutomaticMigrationError,
+            lastSummary: lastAutomaticMigrationSummary
+        },
+        encryptionMigration: {
+            version: 3,
+            lastSummary: lastSummary?.encryptionMigration || null
+        },
+        oauthTokenRefresh: {
+            config: oauthTokenManager.getOAuthRefreshConfig(),
+            lastRunAt: lastOAuthRefreshAt,
+            lastError: lastOAuthRefreshError,
+            lastSummary: lastOAuthRefreshSummary,
+            lastRunStatus: oauthRunStatus,
+            lastRunFailedCount: Number(lastOAuthRefreshSummary?.failed || 0),
+            lastRunPersistenceFailed: Number(lastOAuthRefreshSummary?.persistenceFailed || 0),
+            diagnostics: oauthTokenManager.getDiagnostics()
+        }
+    };
+}
+
+module.exports = {
+    startVerificationRuntime,
+    stopVerificationRuntime,
+    runVerificationMaintenance,
+    runPrivacyDeletionRecoverySafe,
+    getVerificationDiagnostics,
+    waitForMaintenanceIdle,
+    retentionDays,
+    retentionFilters
+};

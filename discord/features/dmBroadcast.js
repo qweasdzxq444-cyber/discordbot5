@@ -1,0 +1,682 @@
+'use strict';
+
+const crypto = require('node:crypto');
+const {
+    Client,
+    GatewayIntentBits,
+    WebhookClient
+} = require('discord.js');
+const { MessageEmbed } = require('../core/discordCompat');
+const { delay, withTimeoutReject } = require('../core/timers');
+const { isDiscordSnowflake } = require('../core/snowflakes');
+const tokenCoordinator = require('../tokens/tokenCoordinator');
+const config = require('../config.json');
+
+const DISCORD_WEBHOOK_PATTERN = /^https:\/\/(?:(?:ptb|canary)\.)?discord(?:app)?\.com\/api\/webhooks\/\d{17,22}\/[a-z0-9_-]+$/i;
+const PRECHECK_TIMEOUT_MS = 15000;
+const STAGED_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+// Concurrency control: 1 job at a time
+let activeBroadcastJob = null;
+
+// Register dmBroadcast subsystem with Master Token Coordinator
+function registerDmBroadcastSubsystem() {
+    tokenCoordinator.registerSubsystem({
+        name: 'dmBroadcast',
+        onTokenQuarantined: (tokenHash, reason) => {
+            if (activeBroadcastJob && tokenCoordinator.hashToken(activeBroadcastJob.token) === tokenHash) {
+                activeBroadcastJob.aborted = true;
+                activeBroadcastJob.abortReason = reason || 'Token was quarantined';
+            }
+        }
+    });
+}
+
+function ensureSubsystemRegistered() {
+    if (!tokenCoordinator.subsystems?.has('dmBroadcast')) {
+        registerDmBroadcastSubsystem();
+    }
+}
+
+registerDmBroadcastSubsystem();
+
+// Short-lived in-memory staged jobs for pending confirmations
+const stagedBroadcasts = new Map();
+
+function isValidWebhookUrl(url) {
+    if (typeof url !== 'string') return false;
+    return DISCORD_WEBHOOK_PATTERN.test(url.trim());
+}
+
+function isBroadcastRunning() {
+    return activeBroadcastJob !== null;
+}
+
+function getActiveBroadcastJob() {
+    return activeBroadcastJob;
+}
+
+function stageBroadcast(userId, data) {
+    const now = Date.now();
+    for (const [key, val] of stagedBroadcasts.entries()) {
+        if (now - val.stagedAt > STAGED_TTL_MS) {
+            stagedBroadcasts.delete(key);
+        }
+    }
+    stagedBroadcasts.set(String(userId), {
+        ...data,
+        stagedAt: now
+    });
+}
+
+function getStagedBroadcast(userId) {
+    const key = String(userId);
+    const staged = stagedBroadcasts.get(key);
+    if (!staged) return null;
+    if (Date.now() - staged.stagedAt > STAGED_TTL_MS) {
+        stagedBroadcasts.delete(key);
+        return null;
+    }
+    return staged;
+}
+
+function clearStagedBroadcast(userId) {
+    stagedBroadcasts.delete(String(userId));
+}
+
+function formatDuration(ms) {
+    const totalSec = Math.max(0, Math.floor(ms / 1000));
+    const mins = Math.floor(totalSec / 60);
+    const secs = totalSec % 60;
+    if (mins > 0) {
+        return `${mins} นาที ${secs} วินาที`;
+    }
+    return `${secs} วินาที`;
+}
+
+function buildMemberLogEmbed({
+    member,
+    botUser,
+    index,
+    total,
+    success,
+    errorReason = null
+}) {
+    const successEmoji = config.emojis?.check_alt || config.emojis?.success || '✅';
+    const errorEmoji = config.emojis?.red_card || config.emojis?.error || '❌';
+    const userEmoji = config.emojis?.user || '👤';
+
+    const color = success
+        ? (config.system?.themeColors?.success || '#57F287')
+        : (config.system?.themeColors?.error || '#ED4245');
+
+    const statusText = success
+        ? `${successEmoji} **ส่งสำเร็จ**`
+        : `${errorEmoji} **ล้มเหลว** (${errorReason || 'ผู้ใช้ปิด DM หรือบล็อกบอท'})`;
+
+    const userTag = member.user?.tag || member.user?.username || member.id;
+    const avatarUrl = typeof member.user?.displayAvatarURL === 'function'
+        ? member.user.displayAvatarURL({ dynamic: true, size: 256 })
+        : null;
+
+    const embed = new MessageEmbed()
+        .setColor(color)
+        .setTitle(`[${index}/${total}] แจ้งเตือนการส่ง DM`)
+        .addFields(
+            { name: `${userEmoji} ผู้รับ`, value: `<@${member.id}> (\`${userTag}\`)`, inline: true },
+            { name: '🆔 User ID', value: `\`${member.id}\``, inline: true },
+            { name: '📊 สถานะ', value: statusText, inline: false },
+            { name: '⏰ เวลาที่ส่ง', value: `<t:${Math.floor(Date.now() / 1000)}:T> (<t:${Math.floor(Date.now() / 1000)}:R>)`, inline: false }
+        );
+
+    if (avatarUrl) {
+        embed.setThumbnail(avatarUrl);
+    }
+
+    return embed;
+}
+
+function buildFinalSummaryEmbed({
+    guild,
+    botUser,
+    total,
+    sent,
+    failed,
+    durationMs
+}) {
+    const color = config.system?.themeColors?.info || '#5865F2';
+    const universeEmoji = config.emojis?.universe || '✨';
+    const successEmoji = config.emojis?.check_alt || config.emojis?.success || '✅';
+    const errorEmoji = config.emojis?.red_card || config.emojis?.error || '❌';
+    const membersEmoji = config.emojis?.members || '👥';
+    const serverEmoji = config.emojis?.server_icon || '🌐';
+
+    const embed = new MessageEmbed()
+        .setColor(color)
+        .setTitle(`${universeEmoji} : รายงานสรุปการกระจายข้อความ DM`)
+        .setDescription(`ภารกิจส่งข้อความไปยังสมาชิกในเซิร์ฟเวอร์ **${guild?.name || 'Unknown Guild'}** ดำเนินการเสร็จสิ้นสมบูรณ์`)
+        .addFields(
+            { name: `${membersEmoji} สมาชิกเป้าหมายทั้งหมด`, value: `**${total}** คน (ไม่รวมบอท)`, inline: true },
+            { name: `${successEmoji} ส่งสำเร็จ`, value: `**${sent}** คน`, inline: true },
+            { name: `${errorEmoji} ล้มเหลว (ปิด DM)`, value: `**${failed}** คน`, inline: true },
+            { name: '⏱️ เวลาที่ใช้ทั้งหมด', value: `\`${formatDuration(durationMs)}\``, inline: true },
+            { name: '🤖 บอทผู้ส่ง (ตัวรอง)', value: `\`${botUser?.tag || botUser?.id || 'Unknown'}\``, inline: true },
+            { name: `${serverEmoji} เซิร์ฟเวอร์`, value: `\`${guild?.name}\` (\`${guild?.id}\`)`, inline: true }
+        );
+
+    if (guild?.iconUrl) {
+        embed.setThumbnail(guild.iconUrl);
+    }
+
+    return embed;
+}
+
+function normalizeMemberList(memberCollection) {
+    if (Array.isArray(memberCollection)) {
+        return memberCollection;
+    }
+    if (typeof memberCollection?.values === 'function') {
+        return Array.from(memberCollection.values());
+    }
+    return [];
+}
+
+function filterHumanMembers(memberCollection) {
+    const list = normalizeMemberList(memberCollection);
+    return list.filter(m => !m.user?.bot);
+}
+
+function mapSecondaryBotLoginError(err) {
+    const msg = String(err?.message || '');
+    if (msg.includes('401') || msg.includes('TOKEN_INVALID') || msg.includes('An invalid token')) {
+        return 'Bot Token ไม่ถูกต้อง (Invalid Discord Token) กรุณาตรวจสอบ Token อีกครั้ง';
+    }
+    return 'เกิดข้อผิดพลาดในการตรวจสอบบอทตัวรอง กรุณาตรวจสอบความถูกต้องของ Bot Token';
+}
+
+function mapMemberFetchError(fetchErr) {
+    const errMsg = String(fetchErr?.message || '');
+    if (errMsg.includes('Disallowed') || errMsg.includes('intent') || fetchErr?.code === 4014) {
+        return "บอทตัวรองไม่ได้เปิดใช้งาน **'Server Members Intent'** ใน Discord Developer Portal (หมวด Bot -> Privileged Gateway Intents)";
+    }
+    return 'ไม่สามารถดึงรายชื่อสมาชิกในเซิร์ฟเวอร์ได้ กรุณาตรวจสอบสิทธิ์ของบอทตัวรองในเซิร์ฟเวอร์เป้าหมาย';
+}
+
+function calculateAdaptiveThrottleMs(isClosedDm = false) {
+    if (isClosedDm) {
+        // Fast-skip for members who closed DMs or blocked bot (Error 50007)
+        return 400 + crypto.randomInt(0, 200); // 400ms - 600ms
+    }
+    // Turbo adaptive throttle for delivered messages: 1,200ms - 1,500ms
+    return 1200 + crypto.randomInt(0, 300);
+}
+
+function getRetryAfterMs(err) {
+    if (typeof err?.retryAfter === 'number' && err.retryAfter > 0) {
+        return err.retryAfter > 1000 ? err.retryAfter : Math.round(err.retryAfter * 1000);
+    }
+    return 5000;
+}
+
+function parseDmError(err) {
+    if (err?.code === 50007) {
+        return 'ผู้ใช้ปิดรับข้อความ DM หรือไม่มีห้องข้อความร่วมกัน';
+    }
+    return err?.message || 'ไม่สามารถส่งข้อความได้';
+}
+
+async function sendDmWithRetry(member, dmPayload, maxRetries = 5, attempt = 0) {
+    try {
+        await member.send(dmPayload);
+        return { success: true, errorReason: null, isClosedDm: false };
+    } catch (dmErr) {
+        const isRateLimit = dmErr?.status === 429 || dmErr?.code === 429;
+        if (!isRateLimit) {
+            const isClosed = dmErr?.code === 50007;
+            return { success: false, errorReason: parseDmError(dmErr), isClosedDm: isClosed };
+        }
+
+        if (attempt >= maxRetries) {
+            return {
+                success: false,
+                errorReason: `ส่งข้อความไม่สำเร็จหลังลองใหม่ครบ ${maxRetries} ครั้ง (ติด Rate Limit)`,
+                isClosedDm: false
+            };
+        }
+
+        const retryAfterMs = getRetryAfterMs(dmErr);
+        await delay(retryAfterMs);
+        return sendDmWithRetry(member, dmPayload, maxRetries, attempt + 1);
+    }
+}
+
+async function notifyMemberLog(webhookClient, { member, botUser, index, total, success, errorReason }) {
+    if (!webhookClient) return;
+    try {
+        const logEmbed = buildMemberLogEmbed({
+            member,
+            botUser,
+            index,
+            total,
+            success,
+            errorReason
+        });
+        await webhookClient.send({ embeds: [logEmbed] }).catch(() => {});
+    } catch {
+        // Ignore webhook delivery errors to keep broadcast running
+    }
+}
+
+async function notifyFinalSummary(webhookClient, { guildInfo, botUser, total, sent, failed, durationMs }) {
+    if (!webhookClient) return;
+    try {
+        const summaryEmbed = buildFinalSummaryEmbed({
+            guild: guildInfo,
+            botUser,
+            total,
+            sent,
+            failed,
+            durationMs
+        });
+        await webhookClient.send({ embeds: [summaryEmbed] }).catch(() => {});
+    } catch {}
+}
+
+async function notifyFatalError(webhookClient, { jobErr, activeJob }) {
+    if (!webhookClient) return;
+    try {
+        const errorEmbed = new MessageEmbed()
+            .setColor(config.system?.themeColors?.error || '#ED4245')
+            .setTitle(`${config.emojis?.error || '❌'} การกระจายข้อความ DM หยุดชะงัก`)
+            .setDescription('เกิดข้อผิดพลาดขัดข้องระหว่างการทำงาน กรุณาตรวจสอบบันทึกระบบ')
+            .addFields(
+                {
+                    name: '📊 สถิติก่อนหยุดทำงาน',
+                    value: `ส่งสำเร็จ: **${activeJob?.sent || 0}** | ล้มเหลว: **${activeJob?.failed || 0}**`,
+                    inline: true
+                }
+            );
+        await webhookClient.send({ embeds: [errorEmbed] }).catch(() => {});
+    } catch {}
+}
+
+function buildDmPayload(message, imageUrl) {
+    const payload = { content: message };
+    if (imageUrl) {
+        payload.embeds = [new MessageEmbed().setImage(imageUrl)];
+    }
+    return payload;
+}
+
+function reportProgress(onProgress, { index, total, sent, failed }) {
+    if (typeof onProgress === 'function') {
+        try {
+            onProgress({ index, total, sent, failed });
+        } catch {}
+    }
+}
+
+async function processMemberBroadcast({
+    member,
+    index,
+    total,
+    dmPayload,
+    webhookClient,
+    botUser,
+    activeJob,
+    onProgress
+}) {
+    const sendResult = await sendDmWithRetry(member, dmPayload);
+    if (sendResult.success) {
+        activeJob.sent++;
+    } else {
+        activeJob.failed++;
+    }
+
+    // Asynchronous non-blocking: dispatch member log to webhook in background without blocking the loop
+    notifyMemberLog(webhookClient, {
+        member,
+        botUser,
+        index,
+        total,
+        success: sendResult.success,
+        errorReason: sendResult.errorReason
+    }).catch(() => {});
+
+    reportProgress(onProgress, {
+        index,
+        total,
+        sent: activeJob.sent,
+        failed: activeJob.failed
+    });
+
+    // Fast-skip for closed DMs (400-600ms) or Turbo adaptive throttle for delivered DMs (1,200-1,500ms)
+    const throttleMs = calculateAdaptiveThrottleMs(sendResult.isClosedDm);
+    await delay(throttleMs);
+}
+
+/**
+ * Validates the secondary bot token, verifies membership in the guild,
+ * checks Server Members Intent, and counts eligible non-bot members.
+ */
+async function validateSecondaryBot(token, guildId, options = {}) {
+    const trimmedToken = String(token || '').trim();
+    const targetGuildId = String(guildId || '').trim();
+
+    if (!trimmedToken) {
+        return { ok: false, error: 'กรุณากรอก Bot Token ของบอทตัวรอง' };
+    }
+
+    if (!isDiscordSnowflake(targetGuildId)) {
+        return { ok: false, error: 'Server ID (Guild ID) ไม่ถูกต้องตามรูปแบบ Discord Snowflake (17-22 หลัก)' };
+    }
+
+    const ClientClass = options.ClientClass || Client;
+    const tempClient = new ClientClass({
+        intents: [
+            GatewayIntentBits.Guilds,
+            GatewayIntentBits.GuildMembers
+        ]
+    });
+
+    try {
+        await withTimeoutReject(
+            tempClient.login(trimmedToken),
+            PRECHECK_TIMEOUT_MS,
+            'การเชื่อมต่อกับ Bot Token หมดเวลา (Login Timeout 15s)'
+        );
+
+        let guild = null;
+        try {
+            guild = await tempClient.guilds.fetch(targetGuildId);
+        } catch {
+            return {
+                ok: false,
+                error: `บอทตัวรองไม่ได้อยู่ในเซิร์ฟเวอร์เป้าหมาย (Guild ID: \`${targetGuildId}\`) กรุณาเชิญบอทเข้าเซิร์ฟเวอร์ก่อนใช้งาน`
+            };
+        }
+
+        let nonBotMembers = [];
+        try {
+            const memberCollection = await guild.members.fetch();
+            nonBotMembers = filterHumanMembers(memberCollection);
+        } catch (fetchErr) {
+            return {
+                ok: false,
+                error: mapMemberFetchError(fetchErr)
+            };
+        }
+
+        const targetCount = nonBotMembers.length;
+        if (targetCount === 0) {
+            return {
+                ok: false,
+                error: 'ไม่พบสมาชิกที่เป็นบุคคลจริง (Human members) ในเซิร์ฟเวอร์เป้าหมายที่บอทสามารถส่ง DM ได้'
+            };
+        }
+
+        const botUser = {
+            id: tempClient.user?.id || '',
+            tag: tempClient.user?.tag || tempClient.user?.username || '',
+            avatarUrl: typeof tempClient.user?.displayAvatarURL === 'function'
+                ? tempClient.user.displayAvatarURL({ dynamic: true, size: 256 })
+                : null
+        };
+
+        // Register token type and release any quarantine since secondary bot login succeeded
+        tokenCoordinator.setTokenType(trimmedToken, 'bot');
+        tokenCoordinator.releaseQuarantine(trimmedToken);
+        tokenCoordinator.cacheTokenProfile(trimmedToken, {
+            id: botUser.id,
+            username: botUser.tag,
+            isBot: true,
+            tokenType: 'bot',
+            category: 'bot'
+        });
+
+        const guildInfo = {
+            id: guild.id,
+            name: guild.name,
+            iconUrl: typeof guild.iconURL === 'function' ? guild.iconURL({ dynamic: true, size: 256 }) : null
+        };
+
+        return {
+            ok: true,
+            botUser,
+            guild: guildInfo,
+            targetCount
+        };
+    } catch (err) {
+        return {
+            ok: false,
+            error: mapSecondaryBotLoginError(err)
+        };
+    } finally {
+        await tempClient.destroy().catch(() => {});
+    }
+}
+
+async function executeBroadcastMemberList({ memberList, dmPayload, webhookClient, botUser, onProgress }) {
+    let index = 0;
+    for (const member of memberList) {
+        if (activeBroadcastJob?.aborted) {
+            console.warn(`[DM_BROADCAST] ⚠️ Broadcast job aborted: ${activeBroadcastJob.abortReason || 'Quarantined or cancelled'}`);
+            break;
+        }
+        index++;
+        await processMemberBroadcast({
+            member,
+            index,
+            total: memberList.length,
+            dmPayload,
+            webhookClient,
+            botUser,
+            activeJob: activeBroadcastJob,
+            onProgress
+        });
+    }
+}
+
+function safeInvokeOnComplete(onComplete, payload) {
+    if (typeof onComplete === 'function') {
+        try {
+            onComplete(payload);
+        } catch {
+            // Ignore callback exceptions
+        }
+    }
+}
+
+async function runBroadcastJobLoop({
+    broadcastClient,
+    webhookClient,
+    trimmedToken,
+    targetGuildId,
+    cleanMessage,
+    cleanImageUrl,
+    onProgress,
+    onComplete
+}) {
+    const startTime = Date.now();
+    try {
+        await broadcastClient.login(trimmedToken);
+
+        const botUser = {
+            id: broadcastClient.user?.id,
+            tag: broadcastClient.user?.tag || broadcastClient.user?.username || 'Helper Bot'
+        };
+
+        const guild = await broadcastClient.guilds.fetch(targetGuildId);
+        const guildInfo = {
+            id: guild.id,
+            name: guild.name,
+            iconUrl: typeof guild.iconURL === 'function' ? guild.iconURL({ dynamic: true, size: 256 }) : null
+        };
+
+        const memberCollection = await guild.members.fetch();
+        const memberList = filterHumanMembers(memberCollection);
+        activeBroadcastJob.total = memberList.length;
+
+        const dmPayload = buildDmPayload(cleanMessage, cleanImageUrl);
+
+        await executeBroadcastMemberList({ memberList, dmPayload, webhookClient, botUser, onProgress });
+
+        const durationMs = Date.now() - startTime;
+        await notifyFinalSummary(webhookClient, {
+            guildInfo,
+            botUser,
+            total: memberList.length,
+            sent: activeBroadcastJob.sent,
+            failed: activeBroadcastJob.failed,
+            durationMs
+        });
+
+        safeInvokeOnComplete(onComplete, {
+            ok: true,
+            total: memberList.length,
+            sent: activeBroadcastJob.sent,
+            failed: activeBroadcastJob.failed,
+            durationMs
+        });
+    } catch (jobErr) {
+        console.error('[DM_BROADCAST] ❌ Broadcast job fatal error:', jobErr.message);
+        await notifyFatalError(webhookClient, { jobErr, activeJob: activeBroadcastJob });
+
+        safeInvokeOnComplete(onComplete, {
+            ok: false,
+            error: jobErr.message,
+            sent: activeBroadcastJob?.sent || 0,
+            failed: activeBroadcastJob?.failed || 0
+        });
+    } finally {
+        tokenCoordinator.releaseActivity(trimmedToken, 'dmBroadcast');
+        activeBroadcastJob = null;
+        await broadcastClient.destroy().catch(() => {});
+        if (typeof webhookClient?.destroy === 'function') {
+            try { webhookClient.destroy(); } catch {}
+        }
+    }
+}
+
+/**
+ * Starts the broadcast worker job.
+ */
+async function startBroadcastJob({
+    token,
+    guildId,
+    message,
+    imageUrl = '',
+    webhookUrl,
+    initiatedBy,
+    onProgress = null,
+    onComplete = null,
+    ClientClass = Client,
+    WebhookClientClass = WebhookClient
+}) {
+    if (activeBroadcastJob !== null) {
+        return {
+            ok: false,
+            error: 'มีงานกระจายข้อความ DM กำลังทำงานอยู่ในขณะนี้ กรุณารอให้งานปัจจุบันเสร็จสิ้นก่อนเริ่มงานใหม่'
+        };
+    }
+
+    const trimmedToken = String(token || '').trim();
+    const targetGuildId = String(guildId || '').trim();
+    const cleanMessage = String(message || '').trim();
+    const cleanImageUrl = String(imageUrl || '').trim();
+    const cleanWebhookUrl = String(webhookUrl || '').trim();
+
+    if (tokenCoordinator.isQuarantined(trimmedToken)) {
+        return {
+            ok: false,
+            error: 'Token ของบอทตัวรองนี้ถูกระงับชั่วคราว (Quarantined) เนื่องจากตรวจพบข้อผิดพลาดหรือ 401 Unauthorized กรุณาตรวจสอบ Token อีกครั้ง'
+        };
+    }
+
+    if (!isValidWebhookUrl(cleanWebhookUrl)) {
+        return { ok: false, error: 'ลิงก์ Webhook URL ไม่ถูกต้องตามรูปแบบ Discord Webhook' };
+    }
+
+    const broadcastClient = new ClientClass({
+        intents: [
+            GatewayIntentBits.Guilds,
+            GatewayIntentBits.GuildMembers,
+            GatewayIntentBits.DirectMessages
+        ]
+    });
+
+    let webhookClient = null;
+    try {
+        webhookClient = new WebhookClientClass({ url: cleanWebhookUrl });
+    } catch (err) {
+        return { ok: false, error: 'ไม่สามารถเชื่อมต่อกับ Webhook ได้ กรุณาตรวจสอบ URL ของ Webhook อีกครั้ง' };
+    }
+
+    ensureSubsystemRegistered();
+
+    activeBroadcastJob = {
+        token: trimmedToken,
+        aborted: false,
+        initiatedBy,
+        guildId: targetGuildId,
+        startedAt: Date.now(),
+        total: 0,
+        sent: 0,
+        failed: 0,
+        status: 'running'
+    };
+
+    tokenCoordinator.acquireActivity(trimmedToken, 'dmBroadcast', {
+        guildId: targetGuildId,
+        initiatedBy
+    });
+
+    // Run execution asynchronously in the background so the interaction returns promptly
+    runBroadcastJobLoop({
+        broadcastClient,
+        webhookClient,
+        trimmedToken,
+        targetGuildId,
+        cleanMessage,
+        cleanImageUrl,
+        onProgress,
+        onComplete
+    });
+
+    return {
+        ok: true,
+        message: 'เริ่มการกระจายข้อความ DM สำเร็จ บอทตัวรองกำลังดำเนินการส่งในเบื้องหลัง'
+    };
+}
+
+module.exports = {
+    DISCORD_WEBHOOK_PATTERN,
+    isValidWebhookUrl,
+    isBroadcastRunning,
+    getActiveBroadcastJob,
+    stageBroadcast,
+    getStagedBroadcast,
+    clearStagedBroadcast,
+    formatDuration,
+    buildMemberLogEmbed,
+    buildFinalSummaryEmbed,
+    validateSecondaryBot,
+    startBroadcastJob,
+    registerDmBroadcastSubsystem,
+    _test: {
+        resetActiveJob: () => {
+            if (activeBroadcastJob?.token) {
+                tokenCoordinator.releaseActivity(activeBroadcastJob.token, 'dmBroadcast');
+            }
+            activeBroadcastJob = null;
+        },
+        setActiveJob: (job) => {
+            ensureSubsystemRegistered();
+            activeBroadcastJob = job;
+        },
+        registerDmBroadcastSubsystem,
+        calculateAdaptiveThrottleMs,
+        sendDmWithRetry,
+        stagedBroadcasts
+    }
+};
